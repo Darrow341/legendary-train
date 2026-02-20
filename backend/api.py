@@ -4,31 +4,46 @@ import os
 import time
 from datetime import datetime, UTC
 from pathlib import Path
+from typing import Any, Dict
 
 import requests
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from metar_core import (
     load_model,
+    metar_score,
+    taf_score,
+    pirep_score,
+    is_in_conus,
+    is_pilot_pirep,
     aw_fetch_global_most_recent,
     filter_conus_from_aw,
-    metar_score,
+    aw_fetch_taf_most_recent_global,
+    aw_fetch_pirep_last_hours_global,
 )
 
 # ----------------------------
 # Config via env vars
 # ----------------------------
-MODEL_PATH = os.getenv("MODEL_PATH", "rarity_model.json")
-LENGTH_WEIGHT = float(os.getenv("LENGTH_WEIGHT", "0.02"))
-CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "45"))
+MODEL_METAR_PATH = os.getenv("MODEL_PATH", "rarity_model.json")
+MODEL_TAF_PATH = os.getenv("TAF_MODEL_PATH", "rarity_taf.json.gz")
+MODEL_PIREP_PATH = os.getenv("PIREP_MODEL_PATH", "rarity_pirep.json.gz")
 
-app = FastAPI(title="METAR Leaderboard API", version="0.1.0")
+LENGTH_WEIGHT = float(os.getenv("LENGTH_WEIGHT", "0.02"))
+TAF_LENGTH_WEIGHT = float(os.getenv("TAF_LENGTH_WEIGHT", "0.01"))
+PIREP_LENGTH_WEIGHT = float(os.getenv("PIREP_LENGTH_WEIGHT", "0.005"))
+
+CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "45"))
+TAF_CACHE_SECONDS = int(os.getenv("TAF_CACHE_SECONDS", "300"))
+PIREP_CACHE_SECONDS = int(os.getenv("PIREP_CACHE_SECONDS", "120"))
+
+app = FastAPI(title="Aviation Weather Leaderboard API", version="0.2.1")
 
 # ----------------------------
-# CORS (mainly for Vite dev server mode)
+# CORS (Vite dev server)
 # ----------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -42,37 +57,59 @@ app.add_middleware(
 )
 
 # ----------------------------
-# Load model once at startup
+# Load models once at startup
 # ----------------------------
-model = load_model(MODEL_PATH)
+model_metar = load_model(MODEL_METAR_PATH)
+model_taf = load_model(MODEL_TAF_PATH) if Path(MODEL_TAF_PATH).exists() else None
+model_pirep = load_model(MODEL_PIREP_PATH) if Path(MODEL_PIREP_PATH).exists() else None
 
-# Simple in-memory cache for AviationWeather response
-_cache = {"ts": 0.0, "data": None}
+# ----------------------------
+# Simple in-memory caches
+# ----------------------------
+_cache_metar: Dict[str, Any] = {"ts": 0.0, "data": None}
+_cache_taf: Dict[str, Any] = {"ts": 0.0, "data": None}
+_cache_pirep: Dict[str, Any] = {"ts": 0.0, "data": None, "hours": None}
 
 
-def _get_aw_data_cached(session: requests.Session):
+def _cached_fetch(cache: Dict[str, Any], ttl: int, fetch_fn):
     now = time.time()
-    if _cache["data"] is not None and (now - _cache["ts"]) < CACHE_SECONDS:
-        return _cache["data"]
-    data = aw_fetch_global_most_recent(session)
-    _cache["ts"] = now
-    _cache["data"] = data
+    if cache.get("data") is not None and (now - float(cache.get("ts", 0.0))) < ttl:
+        return cache["data"]
+    data = fetch_fn()
+    cache["ts"] = now
+    cache["data"] = data
     return data
 
 
 # ----------------------------
 # API routes
 # ----------------------------
+@app.get("/api/health")
+def health():
+    return {
+        "ok": True,
+        "models": {
+            "metar": str(Path(MODEL_METAR_PATH).resolve()),
+            "taf": str(Path(MODEL_TAF_PATH).resolve()) if model_taf else None,
+            "pirep": str(Path(MODEL_PIREP_PATH).resolve()) if model_pirep else None,
+        },
+    }
+
+
 @app.get("/api/leaderboard")
 def leaderboard(
     top: int = Query(25, ge=1, le=200),
     conus: bool = Query(True),
 ):
     """
-    Returns top-N most complex METARs right now, including lat/lon for map plotting.
+    METAR leaderboard (AviationWeather mostRecent).
     """
     with requests.Session() as session:
-        metars = _get_aw_data_cached(session)
+
+        def _fetch():
+            return aw_fetch_global_most_recent(session)
+
+        metars = _cached_fetch(_cache_metar, CACHE_SECONDS, _fetch)
         filtered = filter_conus_from_aw(metars) if conus else metars
 
         now = datetime.now(UTC)
@@ -94,9 +131,10 @@ def leaderboard(
 
             rows.append(
                 {
+                    "product": "METAR",
                     "station": (m.get("icaoId") or "----").strip(),
-                    "score": metar_score(raw, model, length_weight=LENGTH_WEIGHT, month=month),
-                    "metar": raw,
+                    "score": metar_score(raw, model_metar, length_weight=LENGTH_WEIGHT, month=month),
+                    "text": raw,
                     "lat": latf,
                     "lon": lonf,
                 }
@@ -107,15 +145,184 @@ def leaderboard(
 
         return {
             "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "product": "METAR",
             "top": top,
             "count": len(rows),
             "rows": rows,
         }
 
 
-@app.get("/api/health")
-def health():
-    return {"ok": True}
+@app.get("/api/taf")
+def taf_leaderboard(
+    top: int = Query(25, ge=1, le=200),
+):
+    """
+    TAF leaderboard (AviationWeather mostRecent).
+    """
+    if model_taf is None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"TAF model not loaded. Missing file: {MODEL_TAF_PATH}"},
+        )
+
+    with requests.Session() as session:
+
+        def _fetch():
+            return aw_fetch_taf_most_recent_global(session)
+
+        tafs = _cached_fetch(_cache_taf, TAF_CACHE_SECONDS, _fetch)
+
+        now = datetime.now(UTC)
+        month = now.month
+
+        rows = []
+        for t in tafs:
+            raw = (t.get("rawTAF") or t.get("rawOb") or t.get("raw") or "").strip()
+            if not raw:
+                continue
+
+            lat = t.get("lat")
+            lon = t.get("lon")
+            try:
+                latf = float(lat) if lat is not None else None
+                lonf = float(lon) if lon is not None else None
+            except Exception:
+                latf, lonf = None, None
+
+            station = (t.get("stationId") or t.get("icaoId") or t.get("station") or "----").strip()
+
+            rows.append(
+                {
+                    "product": "TAF",
+                    "station": station,
+                    "score": taf_score(raw, model_taf, length_weight=TAF_LENGTH_WEIGHT, month=month),
+                    "text": raw,
+                    "lat": latf,
+                    "lon": lonf,
+                }
+            )
+
+        rows.sort(key=lambda x: x["score"], reverse=True)
+        rows = rows[:top]
+
+        return {
+            "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "product": "TAF",
+            "top": top,
+            "count": len(rows),
+            "rows": rows,
+        }
+
+
+@app.get("/api/pirep")
+def pirep_leaderboard(
+    top: int = Query(25, ge=1, le=200),
+    hours: int = Query(24, ge=1, le=72),
+    conus: bool = Query(True),
+    pilot_only: bool = Query(True),
+):
+    """
+    PIREP leaderboard (AviationWeather last N hours).
+
+    Defaults:
+      - conus=true: keep only reports with lat/lon inside CONUS bounds.
+      - pilot_only=true: keep only classic pilot reports (slash groups like /OV /TM /FL ...).
+    """
+    if model_pirep is None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"PIREP model not loaded. Missing file: {MODEL_PIREP_PATH}"},
+        )
+
+    with requests.Session() as session:
+
+        def _fetch():
+            return aw_fetch_pirep_last_hours_global(session, hours=hours)
+
+        # cache depends on hours
+        now_ts = time.time()
+        if (
+            _cache_pirep.get("data") is not None
+            and _cache_pirep.get("hours") == hours
+            and (now_ts - float(_cache_pirep.get("ts", 0.0))) < PIREP_CACHE_SECONDS
+        ):
+            pireps = _cache_pirep["data"]
+        else:
+            pireps = _fetch()
+            _cache_pirep["ts"] = now_ts
+            _cache_pirep["data"] = pireps
+            _cache_pirep["hours"] = hours
+
+        now = datetime.now(UTC)
+        month = now.month
+
+        rows = []
+        dropped_no_text = 0
+        dropped_non_pilot = 0
+        dropped_no_latlon = 0
+        dropped_non_conus = 0
+
+        for p in pireps:
+            text = (p.get("raw") or p.get("report") or p.get("text") or p.get("rawOb") or "").strip()
+            if not text:
+                dropped_no_text += 1
+                continue
+
+            if pilot_only and not is_pilot_pirep(text):
+                dropped_non_pilot += 1
+                continue
+
+            lat = p.get("lat")
+            lon = p.get("lon")
+            try:
+                latf = float(lat) if lat is not None else None
+                lonf = float(lon) if lon is not None else None
+            except Exception:
+                latf, lonf = None, None
+
+            if conus:
+                if latf is None or lonf is None:
+                    dropped_no_latlon += 1
+                    continue
+                if not is_in_conus(latf, lonf):
+                    dropped_non_conus += 1
+                    continue
+
+            # best-effort station/source label
+            station = (p.get("station") or p.get("stationId") or p.get("icaoId") or "PIREP").strip()
+
+            rows.append(
+                {
+                    "product": "PIREP",
+                    "station": station,
+                    "score": pirep_score(text, model_pirep, length_weight=PIREP_LENGTH_WEIGHT, month=month),
+                    "text": text,
+                    "lat": latf,
+                    "lon": lonf,
+                }
+            )
+
+        rows.sort(key=lambda x: x["score"], reverse=True)
+        rows = rows[:top]
+
+        return {
+            "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "product": "PIREP",
+            "top": top,
+            "hours": hours,
+            "count": len(rows),
+            "rows": rows,
+            "filters": {
+                "conus": conus,
+                "pilot_only": pilot_only,
+            },
+            "dropped": {
+                "no_text": dropped_no_text,
+                "non_pilot": dropped_non_pilot,
+                "no_latlon": dropped_no_latlon if conus else 0,
+                "non_conus": dropped_non_conus if conus else 0,
+            },
+        }
 
 
 # ----------------------------
@@ -125,7 +332,6 @@ FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 ASSETS_DIR = FRONTEND_DIST / "assets"
 INDEX_HTML = FRONTEND_DIST / "index.html"
 
-# Serve /assets/* directly from the Vite build output
 if ASSETS_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 
@@ -141,15 +347,10 @@ def serve_index():
     return {"message": "Frontend not built. Run: cd frontend && npm run build"}
 
 
-# Catch-all: return index.html for SPA routes, but NEVER for /api/*
 @app.get("/{full_path:path}")
 def spa_fallback(request: Request, full_path: str):
-    # Leave API alone
     if full_path.startswith("api/"):
-        return FileResponse(INDEX_HTML) if False else ({"detail": "Not Found"}, 404)  # should never hit if API exists
-
-    # If frontend exists, serve SPA entry for any other path
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if _frontend_available():
         return FileResponse(INDEX_HTML)
-
     return {"message": "Frontend not built. Run: cd frontend && npm run build"}
