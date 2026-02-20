@@ -17,11 +17,10 @@ from metar_core import (
     metar_score,
     taf_score,
     pirep_score,
-    is_in_conus,
-    is_pilot_pirep,
     aw_fetch_global_most_recent,
     filter_conus_from_aw,
     aw_fetch_taf_most_recent_global,
+    aw_fetch_taf_most_recent_conus,
     aw_fetch_pirep_last_hours_global,
 )
 
@@ -67,7 +66,7 @@ model_pirep = load_model(MODEL_PIREP_PATH) if Path(MODEL_PIREP_PATH).exists() el
 # Simple in-memory caches
 # ----------------------------
 _cache_metar: Dict[str, Any] = {"ts": 0.0, "data": None}
-_cache_taf: Dict[str, Any] = {"ts": 0.0, "data": None}
+_cache_taf: Dict[str, Any] = {"ts": 0.0, "data": None, "conus": None}
 _cache_pirep: Dict[str, Any] = {"ts": 0.0, "data": None, "hours": None}
 
 
@@ -155,9 +154,12 @@ def leaderboard(
 @app.get("/api/taf")
 def taf_leaderboard(
     top: int = Query(25, ge=1, le=200),
+    conus: bool = Query(True),
 ):
     """
     TAF leaderboard (AviationWeather mostRecent).
+
+    Default is CONUS-only via bbox filter.
     """
     if model_taf is None:
         return JSONResponse(
@@ -167,10 +169,24 @@ def taf_leaderboard(
 
     with requests.Session() as session:
 
-        def _fetch():
+        def _fetch_for(conus_flag: bool):
+            if conus_flag:
+                return aw_fetch_taf_most_recent_conus(session)
             return aw_fetch_taf_most_recent_global(session)
 
-        tafs = _cached_fetch(_cache_taf, TAF_CACHE_SECONDS, _fetch)
+        # Cache depends on conus flag
+        now_ts = time.time()
+        if (
+            _cache_taf.get("data") is not None
+            and _cache_taf.get("conus") == conus
+            and (now_ts - float(_cache_taf.get("ts", 0.0))) < TAF_CACHE_SECONDS
+        ):
+            tafs = _cache_taf["data"]
+        else:
+            tafs = _fetch_for(conus)
+            _cache_taf["ts"] = now_ts
+            _cache_taf["data"] = tafs
+            _cache_taf["conus"] = conus
 
         now = datetime.now(UTC)
         month = now.month
@@ -209,6 +225,7 @@ def taf_leaderboard(
             "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "product": "TAF",
             "top": top,
+            "conus": conus,
             "count": len(rows),
             "rows": rows,
         }
@@ -218,15 +235,9 @@ def taf_leaderboard(
 def pirep_leaderboard(
     top: int = Query(25, ge=1, le=200),
     hours: int = Query(24, ge=1, le=72),
-    conus: bool = Query(True),
-    pilot_only: bool = Query(True),
 ):
     """
     PIREP leaderboard (AviationWeather last N hours).
-
-    Defaults:
-      - conus=true: keep only reports with lat/lon inside CONUS bounds.
-      - pilot_only=true: keep only classic pilot reports (slash groups like /OV /TM /FL ...).
     """
     if model_pirep is None:
         return JSONResponse(
@@ -257,19 +268,9 @@ def pirep_leaderboard(
         month = now.month
 
         rows = []
-        dropped_no_text = 0
-        dropped_non_pilot = 0
-        dropped_no_latlon = 0
-        dropped_non_conus = 0
-
         for p in pireps:
             text = (p.get("raw") or p.get("report") or p.get("text") or p.get("rawOb") or "").strip()
             if not text:
-                dropped_no_text += 1
-                continue
-
-            if pilot_only and not is_pilot_pirep(text):
-                dropped_non_pilot += 1
                 continue
 
             lat = p.get("lat")
@@ -280,21 +281,10 @@ def pirep_leaderboard(
             except Exception:
                 latf, lonf = None, None
 
-            if conus:
-                if latf is None or lonf is None:
-                    dropped_no_latlon += 1
-                    continue
-                if not is_in_conus(latf, lonf):
-                    dropped_non_conus += 1
-                    continue
-
-            # best-effort station/source label
-            station = (p.get("station") or p.get("stationId") or p.get("icaoId") or "PIREP").strip()
-
             rows.append(
                 {
                     "product": "PIREP",
-                    "station": station,
+                    "station": "PIREP",
                     "score": pirep_score(text, model_pirep, length_weight=PIREP_LENGTH_WEIGHT, month=month),
                     "text": text,
                     "lat": latf,
@@ -312,16 +302,6 @@ def pirep_leaderboard(
             "hours": hours,
             "count": len(rows),
             "rows": rows,
-            "filters": {
-                "conus": conus,
-                "pilot_only": pilot_only,
-            },
-            "dropped": {
-                "no_text": dropped_no_text,
-                "non_pilot": dropped_non_pilot,
-                "no_latlon": dropped_no_latlon if conus else 0,
-                "non_conus": dropped_non_conus if conus else 0,
-            },
         }
 
 

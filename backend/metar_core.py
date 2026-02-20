@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import json
 import math
@@ -25,11 +26,31 @@ CONUS_MAX_LAT = 50.0
 CONUS_MIN_LON = -125.0
 CONUS_MAX_LON = -66.0
 
+def is_in_conus(lat: float, lon: float) -> bool:
+    return (CONUS_MIN_LAT <= lat <= CONUS_MAX_LAT) and (CONUS_MIN_LON <= lon <= CONUS_MAX_LON)
+
 # AviationWeather endpoints
 AW_METAR_URL = "https://aviationweather.gov/api/data/metar"
 AW_TAF_URL = "https://aviationweather.gov/api/data/taf"
 AW_PIREP_URL = "https://aviationweather.gov/api/data/pirep"
+
+# bbox format is: minLon,minLat,maxLon,maxLat
 AW_GLOBAL_BBOX = "-180,-90,180,90"
+AW_CONUS_BBOX = f"{CONUS_MIN_LON},{CONUS_MIN_LAT},{CONUS_MAX_LON},{CONUS_MAX_LAT}"
+
+# IEM endpoints (METAR training already uses these)
+IEM_ASOS_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+IEM_GEOJSON_NETWORK_URL = "https://mesonet.agron.iastate.edu/geojson/network.py"
+
+CONUS_STATE_ABBRS = [
+    "AL","AR","AZ","CA","CO","CT","DC","DE","FL","GA","IA","ID","IL","IN","KS","KY","LA","MA","MD","ME",
+    "MI","MN","MO","MS","MT","NC","ND","NE","NH","NJ","NM","NV","NY","OH","OK","OR","PA","RI","SC","SD",
+    "TN","TX","UT","VA","VT","WA","WI","WV","WY"
+]
+
+MAX_STATION_YEARS = 1000
+PROGRESS_EVERY_ROWS = 200_000
+PROGRESS_EVERY_METARS = 200_000
 
 # -----------------------------
 # Tokenization + difficulty weighting (METAR)
@@ -246,9 +267,7 @@ def metar_score(raw: str, model: SeasonalRarityModel, length_weight: float, mont
     return score
 
 
-# For TAF/PIREP: simpler tokenization.
 RE_SPLIT = re.compile(r"\s+")
-
 
 def _simple_tokens(text: str) -> List[str]:
     t = (text or "").strip()
@@ -273,44 +292,6 @@ def pirep_score(text: str, model: SeasonalRarityModel, length_weight: float, mon
         score += model.token_rarity(tok, month=month) * 1.0
     score += length_weight * len(text)
     return score
-
-
-# -----------------------------
-# CONUS checks
-# -----------------------------
-def is_in_conus(lat: float, lon: float) -> bool:
-    return (CONUS_MIN_LAT <= lat <= CONUS_MAX_LAT) and (CONUS_MIN_LON <= lon <= CONUS_MAX_LON)
-
-
-# -----------------------------
-# PIREP "pilot report only" detector
-# -----------------------------
-# Classic PIREP format usually includes slash groups like:
-#   "... UA /OV ... /TM ... /FL ... /TP ... /TB ... /IC ... /RM ..."
-#
-# Oceanic "ARP ..." position reports typically do NOT contain "/OV" etc.
-PILOT_PIREP_MARKERS = (
-    "/OV", "/TM", "/FL", "/TP", "/TB", "/IC", "/WX", "/SK", "/RM", "/FV", "/TA"
-)
-
-RE_HAS_PILOT_GROUP = re.compile(r"(^|\s)/(OV|TM|FL|TP|TB|IC|WX|SK|RM|FV|TA)\b")
-
-
-def is_pilot_pirep(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-
-    # Strong positive: contains any standard slash group
-    if RE_HAS_PILOT_GROUP.search(t):
-        return True
-
-    # Many pilot reports start with "UA" or "UUA" (sometimes appears as "... UA ...")
-    # But "UA" alone is too broad, so require at least one slash as well.
-    if (t.startswith("UA ") or t.startswith("UUA ") or " UA " in t or " UUA " in t) and "/" in t:
-        return True
-
-    return False
 
 
 # -----------------------------
@@ -346,6 +327,16 @@ def filter_conus_from_aw(metars: List[dict]) -> List[dict]:
 
 def aw_fetch_taf_most_recent_global(session: requests.Session) -> List[dict]:
     params = {"format": "json", "bbox": AW_GLOBAL_BBOX, "mostRecent": "true"}
+    r = session.get(AW_TAF_URL, params=params, timeout=60)
+    r.raise_for_status()
+    if not r.text.strip():
+        return []
+    return r.json()
+
+
+def aw_fetch_taf_most_recent_conus(session: requests.Session) -> List[dict]:
+    # Fast + correct: let AW do the spatial filtering with CONUS bbox
+    params = {"format": "json", "bbox": AW_CONUS_BBOX, "mostRecent": "true"}
     r = session.get(AW_TAF_URL, params=params, timeout=60)
     r.raise_for_status()
     if not r.text.strip():
