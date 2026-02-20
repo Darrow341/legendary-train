@@ -1,6 +1,8 @@
+// App.jsx (DROP-IN REPLACEMENT)
+
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Routes, Route, useNavigate, useParams, Link, Navigate } from "react-router-dom";
-import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
+import { Routes, Route, useNavigate, useParams, Link } from "react-router-dom";
+import { MapContainer, TileLayer, Marker, Popup, LayersControl } from "react-leaflet";
 import L from "leaflet";
 
 // Fix missing default marker icons
@@ -19,47 +21,35 @@ function formatScore(x) {
   return typeof x === "number" ? x.toFixed(2) : "";
 }
 
-function copyText(s) {
-  return navigator.clipboard.writeText(s);
+function getRowText(r) {
+  // Support both old backend ("metar") and new backend ("text")
+  return (r?.text || r?.metar || "").toString();
 }
 
-/**
- * Backend endpoints:
- * - METAR: /api/leaderboard?top=25&conus=true
- * - TAF:   /api/taf?top=25
- * - PIREP: /api/pirep?top=25&hours=24   (we’ll filter ARP client-side unless backend already does)
- */
-async function fetchProduct({ product, top, hours }) {
-  let url = "";
-  if (product === "METAR") {
-    url = `/api/leaderboard?top=${top}&conus=true`;
-  } else if (product === "TAF") {
-    url = `/api/taf?top=${top}`;
-  } else if (product === "PIREP") {
-    // If your backend supports pilot-only filtering via a query param, add it here.
-    // Example (if implemented): `&pilot=true`
-    url = `/api/pirep?top=${top}&hours=${hours}`;
-  } else {
-    throw new Error(`Unknown product: ${product}`);
-  }
-
-  const r = await fetch(url);
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`HTTP ${r.status}${txt ? ` — ${txt}` : ""}`);
-  }
+async function fetchLeaderboard(top) {
+  const r = await fetch(`/api/leaderboard?top=${top}&conus=true`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 
-// client-side filter to remove ARP position reports from PIREP list
-function filterPilotReportsOnly(rows) {
-  return (rows || []).filter((r) => {
-    const t = (r?.text || "").trim().toUpperCase();
-    if (!t) return false;
-    // ARP = aircraft position report, not a classic UA/UUA PIREP
-    if (t.startsWith("ARP ")) return false;
-    return true;
-  });
+async function fetchRainViewerLatestTileUrl({ size = 256, color = 2, options = "1_1" } = {}) {
+  const r = await fetch("https://api.rainviewer.com/public/weather-maps.json");
+  if (!r.ok) throw new Error(`RainViewer HTTP ${r.status}`);
+  const data = await r.json();
+
+  const host = data?.host;
+  const frames = data?.radar?.past;
+  const latest = Array.isArray(frames) && frames.length ? frames[frames.length - 1] : null;
+  const path = latest?.path;
+
+  if (!host || !path) throw new Error("RainViewer response missing host/path");
+
+  // Template: {host}{path}/{size}/{z}/{x}/{y}/{color}/{options}.png
+  return `${host}${path}/${size}/{z}/{x}/{y}/${color}/${options}.png`;
+}
+
+function copyText(s) {
+  return navigator.clipboard.writeText(s);
 }
 
 function Layout({ children }) {
@@ -80,31 +70,27 @@ function Layout({ children }) {
 }
 
 function HomePage({ top, setTop }) {
-  const [product, setProduct] = useState("METAR"); // METAR | TAF | PIREP
-  const [hours, setHours] = useState(24); // PIREP only
-
   const [rows, setRows] = useState([]);
   const [generatedAt, setGeneratedAt] = useState(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
 
+  // Radar overlay state
+  const [radarUrl, setRadarUrl] = useState(null);
+  const [radarErr, setRadarErr] = useState("");
+
   const navigate = useNavigate();
   const mapRef = useRef(null);
 
   const mapCenter = useMemo(() => [39.5, -98.35], []);
-  const markers = (rows || []).filter((r) => typeof r.lat === "number" && typeof r.lon === "number");
+  const markers = rows.filter((r) => typeof r.lat === "number" && typeof r.lon === "number");
 
   async function load() {
     setLoading(true);
     setErr("");
     try {
-      const data = await fetchProduct({ product, top, hours });
-
-      let nextRows = data.rows || [];
-      // PIREP: filter ARP out unless backend already does
-      if (product === "PIREP") nextRows = filterPilotReportsOnly(nextRows);
-
-      setRows(nextRows);
+      const data = await fetchLeaderboard(top);
+      setRows(data.rows || []);
       setGeneratedAt(data.generated_at_utc || null);
     } catch (e) {
       setErr(String(e));
@@ -113,25 +99,39 @@ function HomePage({ top, setTop }) {
     }
   }
 
+  // Load leaderboard periodically
   useEffect(() => {
     load();
     const t = setInterval(load, 60_000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [top, product, hours]);
+  }, [top]);
 
-  function onRowClick(row, index) {
-    // Station permalinks only make sense for METAR/TAF (station is meaningful)
-    if (product === "PIREP") return;
-    navigate(`/station/${encodeURIComponent(row.station)}`);
+  // Load radar periodically
+  useEffect(() => {
+    let alive = true;
+
+    async function loadRadar() {
+      try {
+        setRadarErr("");
+        const url = await fetchRainViewerLatestTileUrl({ size: 256, color: 2, options: "1_1" });
+        if (alive) setRadarUrl(url);
+      } catch (e) {
+        if (alive) setRadarErr(String(e));
+      }
+    }
+
+    loadRadar();
+    const t = setInterval(loadRadar, 120_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  function onRowClick(station) {
+    navigate(`/station/${station}`);
   }
-
-  const title =
-  product === "METAR"
-  ? "METAR Leaderboard (CONUS)"
-  : product === "TAF"
-  ? "TAF Leaderboard (Global)"
-  : `PIREP Leaderboard (Last ${hours}h — Pilot reports only)`;
 
   return (
     <Layout>
@@ -144,27 +144,22 @@ function HomePage({ top, setTop }) {
       justifyContent: "space-between",
       gap: 12,
       marginBottom: 12,
-      flexWrap: "wrap",
     }}
     >
     <div>
-    <div style={{ fontSize: 18, fontWeight: 700 }}>{title}</div>
+    <div style={{ fontSize: 18, fontWeight: 700 }}>METAR Leaderboard (CONUS)</div>
     <div style={{ fontSize: 12, opacity: 0.75 }}>
     {generatedAt ? `UTC: ${generatedAt}` : ""}
     {loading ? " • loading…" : ""}
     </div>
+    {radarErr ? (
+      <div style={{ fontSize: 12, opacity: 0.75, color: "crimson" }}>
+      Radar: {radarErr}
+      </div>
+    ) : null}
     </div>
 
-    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-    <label style={{ fontSize: 12, opacity: 0.8 }}>Product</label>
-    <select value={product} onChange={(e) => setProduct(e.target.value)}>
-    {["METAR", "TAF", "PIREP"].map((p) => (
-      <option key={p} value={p}>
-      {p}
-      </option>
-    ))}
-    </select>
-
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
     <label style={{ fontSize: 12, opacity: 0.8 }}>Top</label>
     <select value={top} onChange={(e) => setTop(Number(e.target.value))}>
     {[10, 25, 50, 100].map((n) => (
@@ -173,20 +168,6 @@ function HomePage({ top, setTop }) {
       </option>
     ))}
     </select>
-
-    {product === "PIREP" ? (
-      <>
-      <label style={{ fontSize: 12, opacity: 0.8 }}>Hours</label>
-      <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>
-      {[6, 12, 24, 36, 48, 72].map((h) => (
-        <option key={h} value={h}>
-        {h}
-        </option>
-      ))}
-      </select>
-      </>
-    ) : null}
-
     <button onClick={load} style={{ padding: "6px 10px" }}>
     Refresh
     </button>
@@ -203,27 +184,27 @@ function HomePage({ top, setTop }) {
     <th style={{ padding: 8 }}>#</th>
     <th style={{ padding: 8 }}>Station</th>
     <th style={{ padding: 8 }}>Score</th>
-    <th style={{ padding: 8 }}>{product}</th>
+    <th style={{ padding: 8 }}>METAR</th>
     </tr>
     </thead>
     <tbody>
     {rows.map((r, i) => (
       <tr
       key={`${r.station}-${i}`}
-      onClick={() => onRowClick(r, i)}
+      onClick={() => onRowClick(r.station)}
       style={{
         borderBottom: "1px solid #eee",
         verticalAlign: "top",
-        cursor: product === "PIREP" ? "default" : "pointer",
-        opacity: product === "PIREP" ? 0.98 : 1,
+        cursor: "pointer",
       }}
-      title={product === "PIREP" ? "" : "Click for a shareable link"}
+      title="Click for a shareable link"
       >
       <td style={{ padding: 8, fontVariantNumeric: "tabular-nums" }}>{i + 1}</td>
       <td style={{ padding: 8, fontFamily: "monospace" }}>{r.station}</td>
       <td style={{ padding: 8, fontVariantNumeric: "tabular-nums" }}>{formatScore(r.score)}</td>
-      {/* backend now uses r.text */}
-      <td style={{ padding: 8, fontFamily: "monospace", whiteSpace: "pre-wrap" }}>{r.text}</td>
+      <td style={{ padding: 8, fontFamily: "monospace", whiteSpace: "pre-wrap" }}>
+      {getRowText(r)}
+      </td>
       </tr>
     ))}
     </tbody>
@@ -240,7 +221,29 @@ function HomePage({ top, setTop }) {
       mapRef.current = map;
     }}
     >
-    <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+    <LayersControl position="topright">
+    <LayersControl.BaseLayer checked name="OpenStreetMap">
+    <TileLayer
+    attribution="&copy; OpenStreetMap contributors"
+    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+    />
+    </LayersControl.BaseLayer>
+
+    <LayersControl.Overlay checked={false} name="Weather radar (RainViewer)">
+    {radarUrl ? (
+      <TileLayer
+      url={radarUrl}
+      opacity={0.55}
+      zIndex={500}
+      // RainViewer radar tiles are limited in zoom (commonly 7)
+      maxZoom={7}
+      />
+    ) : (
+      <></>
+    )}
+    </LayersControl.Overlay>
+    </LayersControl>
+
     {markers.map((r, i) => (
       <Marker key={`${r.station}-${i}`} position={[r.lat, r.lon]}>
       <Popup>
@@ -248,12 +251,10 @@ function HomePage({ top, setTop }) {
       <div>
       <b>{r.station}</b> — score {formatScore(r.score)}
       </div>
-      <div style={{ whiteSpace: "pre-wrap" }}>{r.text}</div>
-      {product !== "PIREP" ? (
-        <div style={{ marginTop: 8 }}>
-        <Link to={`/station/${encodeURIComponent(r.station)}`}>Open link</Link>
-        </div>
-      ) : null}
+      <div style={{ whiteSpace: "pre-wrap" }}>{getRowText(r)}</div>
+      <div style={{ marginTop: 8 }}>
+      <Link to={`/station/${r.station}`}>Open link</Link>
+      </div>
       </div>
       </Popup>
       </Marker>
@@ -268,26 +269,49 @@ function StationPage() {
   const { icao } = useParams();
   const navigate = useNavigate();
 
-  const [top] = useState(200); // fetch bigger list to increase odds of finding station
+  const [top] = useState(100); // fetch bigger list to increase odds of finding the station
   const [rows, setRows] = useState([]);
-  const [generatedAt, setGeneratedAt] = useState(null);
   const [err, setErr] = useState("");
+
+  // Radar overlay state
+  const [radarUrl, setRadarUrl] = useState(null);
+  const [radarErr, setRadarErr] = useState("");
 
   const mapCenter = useMemo(() => [39.5, -98.35], []);
   const mapRef = useRef(null);
 
-  // Station page: still pulls METAR leaderboard (since it’s station-based)
   useEffect(() => {
     (async () => {
       try {
-        const data = await fetchProduct({ product: "METAR", top, hours: 24 });
+        const data = await fetchLeaderboard(top);
         setRows(data.rows || []);
-        setGeneratedAt(data.generated_at_utc || null);
       } catch (e) {
         setErr(String(e));
       }
     })();
   }, [top]);
+
+  // Load radar periodically (Station page too)
+  useEffect(() => {
+    let alive = true;
+
+    async function loadRadar() {
+      try {
+        setRadarErr("");
+        const url = await fetchRainViewerLatestTileUrl({ size: 256, color: 2, options: "1_1" });
+        if (alive) setRadarUrl(url);
+      } catch (e) {
+        if (alive) setRadarErr(String(e));
+      }
+    }
+
+    loadRadar();
+    const t = setInterval(loadRadar, 120_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
 
   const row = rows.find((r) => (r.station || "").toUpperCase() === (icao || "").toUpperCase());
 
@@ -306,13 +330,15 @@ function StationPage() {
   return (
     <Layout>
     <div style={{ overflow: "auto", border: "1px solid #ddd", borderRadius: 12, padding: 12 }}>
-    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
     <div>
     <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "monospace" }}>Station: {icao}</div>
-    <div style={{ fontSize: 12, opacity: 0.75 }}>
-    {generatedAt ? `UTC: ${generatedAt}` : ""}
-    {" • Shareable permalink page"}
-    </div>
+    <div style={{ fontSize: 12, opacity: 0.75 }}>Shareable permalink page</div>
+    {radarErr ? (
+      <div style={{ fontSize: 12, opacity: 0.75, color: "crimson" }}>
+      Radar: {radarErr}
+      </div>
+    ) : null}
     </div>
     <div style={{ display: "flex", gap: 8 }}>
     <button onClick={() => navigate("/")}>Back</button>
@@ -332,7 +358,7 @@ function StationPage() {
       <div style={{ marginTop: 8 }}>
       <b>METAR:</b>
       </div>
-      <div>{row.text}</div>
+      <div>{getRowText(row)}</div>
       {typeof row.lat === "number" && typeof row.lon === "number" ? (
         <div style={{ marginTop: 8 }}>
         <b>Lat/Lon:</b> {row.lat}, {row.lon}
@@ -351,13 +377,29 @@ function StationPage() {
       mapRef.current = map;
     }}
     >
-    <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+    <LayersControl position="topright">
+    <LayersControl.BaseLayer checked name="OpenStreetMap">
+    <TileLayer
+    attribution="&copy; OpenStreetMap contributors"
+    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+    />
+    </LayersControl.BaseLayer>
+
+    <LayersControl.Overlay checked={false} name="Weather radar (RainViewer)">
+    {radarUrl ? (
+      <TileLayer url={radarUrl} opacity={0.55} zIndex={500} maxZoom={7} />
+    ) : (
+      <></>
+    )}
+    </LayersControl.Overlay>
+    </LayersControl>
+
     {row && typeof row.lat === "number" && typeof row.lon === "number" ? (
       <Marker position={[row.lat, row.lon]}>
       <Popup>
       <div style={{ fontFamily: "monospace" }}>
       <b>{row.station}</b> — {formatScore(row.score)}
-      <div style={{ whiteSpace: "pre-wrap" }}>{row.text}</div>
+      <div style={{ whiteSpace: "pre-wrap" }}>{getRowText(row)}</div>
       </div>
       </Popup>
       </Marker>
@@ -375,8 +417,6 @@ export default function App() {
     <Routes>
     <Route path="/" element={<HomePage top={top} setTop={setTop} />} />
     <Route path="/station/:icao" element={<StationPage />} />
-    {/* safety */}
-    <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 }
