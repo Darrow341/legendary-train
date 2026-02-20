@@ -20,8 +20,9 @@ from metar_core import (
     aw_fetch_global_most_recent,
     filter_conus_from_aw,
     aw_fetch_taf_most_recent_global,
-    aw_fetch_taf_most_recent_conus,
+    filter_conus_taf_aw,
     aw_fetch_pirep_last_hours_global,
+    filter_conus_pirep_aw,
 )
 
 # ----------------------------
@@ -46,10 +47,7 @@ app = FastAPI(title="Aviation Weather Leaderboard API", version="0.2.1")
 # ----------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,7 +64,7 @@ model_pirep = load_model(MODEL_PIREP_PATH) if Path(MODEL_PIREP_PATH).exists() el
 # Simple in-memory caches
 # ----------------------------
 _cache_metar: Dict[str, Any] = {"ts": 0.0, "data": None}
-_cache_taf: Dict[str, Any] = {"ts": 0.0, "data": None, "conus": None}
+_cache_taf: Dict[str, Any] = {"ts": 0.0, "data": None}
 _cache_pirep: Dict[str, Any] = {"ts": 0.0, "data": None, "hours": None}
 
 
@@ -128,12 +126,16 @@ def leaderboard(
             except Exception:
                 latf, lonf = None, None
 
+            score = metar_score(raw, model_metar, length_weight=LENGTH_WEIGHT, month=month)
+
             rows.append(
                 {
                     "product": "METAR",
                     "station": (m.get("icaoId") or "----").strip(),
-                    "score": metar_score(raw, model_metar, length_weight=LENGTH_WEIGHT, month=month),
+                    "score": score,
+                    # Back-compat for older UI: expose both keys
                     "text": raw,
+                    "metar": raw,
                     "lat": latf,
                     "lon": lonf,
                 }
@@ -158,8 +160,7 @@ def taf_leaderboard(
 ):
     """
     TAF leaderboard (AviationWeather mostRecent).
-
-    Default is CONUS-only via bbox filter.
+    Default: CONUS only.
     """
     if model_taf is None:
         return JSONResponse(
@@ -169,24 +170,12 @@ def taf_leaderboard(
 
     with requests.Session() as session:
 
-        def _fetch_for(conus_flag: bool):
-            if conus_flag:
-                return aw_fetch_taf_most_recent_conus(session)
+        def _fetch():
             return aw_fetch_taf_most_recent_global(session)
 
-        # Cache depends on conus flag
-        now_ts = time.time()
-        if (
-            _cache_taf.get("data") is not None
-            and _cache_taf.get("conus") == conus
-            and (now_ts - float(_cache_taf.get("ts", 0.0))) < TAF_CACHE_SECONDS
-        ):
-            tafs = _cache_taf["data"]
-        else:
-            tafs = _fetch_for(conus)
-            _cache_taf["ts"] = now_ts
-            _cache_taf["data"] = tafs
-            _cache_taf["conus"] = conus
+        tafs = _cached_fetch(_cache_taf, TAF_CACHE_SECONDS, _fetch)
+        if conus:
+            tafs = filter_conus_taf_aw(tafs)
 
         now = datetime.now(UTC)
         month = now.month
@@ -206,13 +195,16 @@ def taf_leaderboard(
                 latf, lonf = None, None
 
             station = (t.get("stationId") or t.get("icaoId") or t.get("station") or "----").strip()
+            score = taf_score(raw, model_taf, length_weight=TAF_LENGTH_WEIGHT, month=month)
 
             rows.append(
                 {
                     "product": "TAF",
                     "station": station,
-                    "score": taf_score(raw, model_taf, length_weight=TAF_LENGTH_WEIGHT, month=month),
+                    "score": score,
                     "text": raw,
+                    # Back-compat
+                    "metar": raw,
                     "lat": latf,
                     "lon": lonf,
                 }
@@ -225,7 +217,6 @@ def taf_leaderboard(
             "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "product": "TAF",
             "top": top,
-            "conus": conus,
             "count": len(rows),
             "rows": rows,
         }
@@ -235,9 +226,11 @@ def taf_leaderboard(
 def pirep_leaderboard(
     top: int = Query(25, ge=1, le=200),
     hours: int = Query(24, ge=1, le=72),
+    conus: bool = Query(True),
 ):
     """
     PIREP leaderboard (AviationWeather last N hours).
+    Default: CONUS only (removes oceanic ARPs).
     """
     if model_pirep is None:
         return JSONResponse(
@@ -250,7 +243,6 @@ def pirep_leaderboard(
         def _fetch():
             return aw_fetch_pirep_last_hours_global(session, hours=hours)
 
-        # cache depends on hours
         now_ts = time.time()
         if (
             _cache_pirep.get("data") is not None
@@ -263,6 +255,9 @@ def pirep_leaderboard(
             _cache_pirep["ts"] = now_ts
             _cache_pirep["data"] = pireps
             _cache_pirep["hours"] = hours
+
+        if conus:
+            pireps = filter_conus_pirep_aw(pireps)
 
         now = datetime.now(UTC)
         month = now.month
@@ -281,12 +276,16 @@ def pirep_leaderboard(
             except Exception:
                 latf, lonf = None, None
 
+            score = pirep_score(text, model_pirep, length_weight=PIREP_LENGTH_WEIGHT, month=month)
+
             rows.append(
                 {
                     "product": "PIREP",
                     "station": "PIREP",
-                    "score": pirep_score(text, model_pirep, length_weight=PIREP_LENGTH_WEIGHT, month=month),
+                    "score": score,
                     "text": text,
+                    # Back-compat
+                    "metar": text,
                     "lat": latf,
                     "lon": lonf,
                 }

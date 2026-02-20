@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import gzip
 import json
 import math
@@ -26,31 +25,14 @@ CONUS_MAX_LAT = 50.0
 CONUS_MIN_LON = -125.0
 CONUS_MAX_LON = -66.0
 
-def is_in_conus(lat: float, lon: float) -> bool:
-    return (CONUS_MIN_LAT <= lat <= CONUS_MAX_LAT) and (CONUS_MIN_LON <= lon <= CONUS_MAX_LON)
-
 # AviationWeather endpoints
 AW_METAR_URL = "https://aviationweather.gov/api/data/metar"
 AW_TAF_URL = "https://aviationweather.gov/api/data/taf"
 AW_PIREP_URL = "https://aviationweather.gov/api/data/pirep"
 
-# bbox format is: minLon,minLat,maxLon,maxLat
+# Note: AviationWeather bbox is "minLon,minLat,maxLon,maxLat"
 AW_GLOBAL_BBOX = "-180,-90,180,90"
 AW_CONUS_BBOX = f"{CONUS_MIN_LON},{CONUS_MIN_LAT},{CONUS_MAX_LON},{CONUS_MAX_LAT}"
-
-# IEM endpoints (METAR training already uses these)
-IEM_ASOS_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-IEM_GEOJSON_NETWORK_URL = "https://mesonet.agron.iastate.edu/geojson/network.py"
-
-CONUS_STATE_ABBRS = [
-    "AL","AR","AZ","CA","CO","CT","DC","DE","FL","GA","IA","ID","IL","IN","KS","KY","LA","MA","MD","ME",
-    "MI","MN","MO","MS","MT","NC","ND","NE","NH","NJ","NM","NV","NY","OH","OK","OR","PA","RI","SC","SD",
-    "TN","TX","UT","VA","VT","WA","WI","WV","WY"
-]
-
-MAX_STATION_YEARS = 1000
-PROGRESS_EVERY_ROWS = 200_000
-PROGRESS_EVERY_METARS = 200_000
 
 # -----------------------------
 # Tokenization + difficulty weighting (METAR)
@@ -103,6 +85,10 @@ DIFFICULTY_WEIGHT = {
 LOW_CEILING_BONUS = 0.8
 
 
+def is_in_conus(lat: float, lon: float) -> bool:
+    return (CONUS_MIN_LAT <= lat <= CONUS_MAX_LAT) and (CONUS_MIN_LON <= lon <= CONUS_MAX_LON)
+
+
 def classify_token(tok: str) -> str:
     if RE_RVR.match(tok): return "RVR"
     if RE_VV.match(tok): return "VV"
@@ -142,7 +128,7 @@ def normalize_token(tok: str) -> str:
     if cls == "WIND_SHEAR": return "WIND_SHEAR"
     if cls == "RUNWAY_STATE": return "RUNWAY_STATE"
     if cls == "RMK_MARKER": return "RMK"
-    if cls == "WX": return tok
+    if cls == "WX": return tok  # keep exact wx strings
 
     if RE_RWY_DESIG.match(tok): return "RWY_DESIG"
     if RE_FROPA.match(tok): return "PRES_TREND"
@@ -162,7 +148,7 @@ def token_difficulty(tok: str) -> float:
         m = RE_CLOUD.match(tok)
         if m:
             try:
-                h = int(tok[3:6])
+                h = int(tok[3:6])  # hundreds of feet
                 if h <= 5 and m.group(1) in ("BKN", "OVC"):
                     base = base + LOW_CEILING_BONUS
             except Exception:
@@ -257,6 +243,16 @@ def load_model(path: str) -> SeasonalRarityModel:
 # -----------------------------
 # Scores for each product
 # -----------------------------
+RE_SPLIT = re.compile(r"\s+")
+
+
+def _simple_tokens(text: str) -> List[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    return [x for x in RE_SPLIT.split(t) if x]
+
+
 def metar_score(raw: str, model: SeasonalRarityModel, length_weight: float, month: int) -> float:
     toks = tokenize_metar(raw)
     score = 0.0
@@ -267,20 +263,11 @@ def metar_score(raw: str, model: SeasonalRarityModel, length_weight: float, mont
     return score
 
 
-RE_SPLIT = re.compile(r"\s+")
-
-def _simple_tokens(text: str) -> List[str]:
-    t = (text or "").strip()
-    if not t:
-        return []
-    return [x for x in RE_SPLIT.split(t) if x]
-
-
 def taf_score(raw: str, model: SeasonalRarityModel, length_weight: float, month: int) -> float:
     toks = _simple_tokens(raw)
     score = 0.0
     for tok in set(toks):
-        score += model.token_rarity(tok, month=month) * 1.0
+        score += model.token_rarity(tok, month=month)
     score += length_weight * len(raw)
     return score
 
@@ -289,7 +276,7 @@ def pirep_score(text: str, model: SeasonalRarityModel, length_weight: float, mon
     toks = _simple_tokens(text)
     score = 0.0
     for tok in set(toks):
-        score += model.token_rarity(tok, month=month) * 1.0
+        score += model.token_rarity(tok, month=month)
     score += length_weight * len(text)
     return score
 
@@ -334,14 +321,28 @@ def aw_fetch_taf_most_recent_global(session: requests.Session) -> List[dict]:
     return r.json()
 
 
-def aw_fetch_taf_most_recent_conus(session: requests.Session) -> List[dict]:
-    # Fast + correct: let AW do the spatial filtering with CONUS bbox
-    params = {"format": "json", "bbox": AW_CONUS_BBOX, "mostRecent": "true"}
-    r = session.get(AW_TAF_URL, params=params, timeout=60)
-    r.raise_for_status()
-    if not r.text.strip():
-        return []
-    return r.json()
+def filter_conus_taf_aw(tafs: List[dict]) -> List[dict]:
+    """
+    Keep CONUS TAFs:
+      - station id starts with 'K'
+      - lat/lon exist and inside CONUS bounds
+    """
+    out: List[dict] = []
+    for t in tafs:
+        station = (t.get("stationId") or t.get("icaoId") or t.get("station") or "").strip()
+        lat = t.get("lat")
+        lon = t.get("lon")
+        if not station or lat is None or lon is None:
+            continue
+        if not station.startswith("K"):
+            continue
+        try:
+            latf, lonf = float(lat), float(lon)
+        except Exception:
+            continue
+        if is_in_conus(latf, lonf):
+            out.append(t)
+    return out
 
 
 def aw_fetch_pirep_last_hours_global(session: requests.Session, hours: int = 24) -> List[dict]:
@@ -353,11 +354,31 @@ def aw_fetch_pirep_last_hours_global(session: requests.Session, hours: int = 24)
     return r.json()
 
 
+def filter_conus_pirep_aw(pireps: List[dict]) -> List[dict]:
+    """
+    Keep only PIREPs with lat/lon inside CONUS bounds.
+    This removes oceanic ARPs automatically.
+    """
+    out: List[dict] = []
+    for p in pireps:
+        lat = p.get("lat")
+        lon = p.get("lon")
+        if lat is None or lon is None:
+            continue
+        try:
+            latf, lonf = float(lat), float(lon)
+        except Exception:
+            continue
+        if is_in_conus(latf, lonf):
+            out.append(p)
+    return out
+
+
 # -----------------------------
-# Optional CLI (kept minimal)
+# Optional CLI sanity check
 # -----------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Core scoring + AW fetch helpers")
+    ap = argparse.ArgumentParser(description="metar_core helpers")
     ap.add_argument("--health", action="store_true", help="Quick import/test")
     args = ap.parse_args()
     if args.health:
