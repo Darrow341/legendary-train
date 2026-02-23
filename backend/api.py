@@ -14,18 +14,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-# --- Local modules (your repo has these) ---
-from . import history_store as hs
-from .metar_core import (
-    load_model,
-    metar_score,
-    taf_score,
-    pirep_score,
-    aw_fetch_global_most_recent,
-    filter_conus_from_aw,
-    aw_fetch_taf_most_recent_global,
-    aw_fetch_pirep_last_hours_global,
-)
+# ============================================================
+# Local imports (works on Render + local)
+# ============================================================
+try:
+    # Package mode: uvicorn backend.api:app
+    from . import history_store as hs
+    from .metar_core import (
+        load_model,
+        metar_score,
+        taf_score,
+        pirep_score,
+        aw_fetch_global_most_recent,
+        filter_conus_from_aw,
+        aw_fetch_taf_most_recent_global,
+        aw_fetch_pirep_last_hours_global,
+    )
+except ImportError:
+    # Module mode: cd backend && uvicorn api:app (or Render importing without package context)
+    import history_store as hs  # type: ignore
+    from metar_core import (  # type: ignore
+        load_model,
+        metar_score,
+        taf_score,
+        pirep_score,
+        aw_fetch_global_most_recent,
+        filter_conus_from_aw,
+        aw_fetch_taf_most_recent_global,
+        aw_fetch_pirep_last_hours_global,
+    )
 
 # ----------------------------
 # Paths / configuration
