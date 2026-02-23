@@ -6,38 +6,554 @@ import gzip
 import json
 import math
 import os
-import random
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, timedelta, UTC
-from typing import Dict, Iterable, List, Tuple, Optional
+from datetime import UTC, datetime
+from typing import Dict, List, Optional, Tuple
 
 import requests
-from tabulate import tabulate
 
-# -----------------------------
-# Geography: CONUS bounds
-# -----------------------------
 CONUS_MIN_LAT = 24.0
 CONUS_MAX_LAT = 50.0
 CONUS_MIN_LON = -125.0
 CONUS_MAX_LON = -66.0
 
-# AviationWeather endpoints
+
+def is_in_conus(lat: float, lon: float) -> bool:
+    return (CONUS_MIN_LAT <= lat <= CONUS_MAX_LAT) and (CONUS_MIN_LON <= lon <= CONUS_MAX_LON)
+
+
 AW_METAR_URL = "https://aviationweather.gov/api/data/metar"
 AW_TAF_URL = "https://aviationweather.gov/api/data/taf"
 AW_PIREP_URL = "https://aviationweather.gov/api/data/pirep"
 
-# Note: AviationWeather bbox is "minLon,minLat,maxLon,maxLat"
-AW_GLOBAL_BBOX = "-180,-90,180,90"
+AW_METAR_CACHE_XML_GZ = "https://aviationweather.gov/data/cache/metars.cache.xml.gz"
+AW_TAF_CACHE_XML_GZ = "https://aviationweather.gov/data/cache/tafs.cache.xml.gz"
+AW_AIRCRAFTREP_XML_GZ = "https://aviationweather.gov/data/cache/aircraftreports.cache.xml.gz"
+AW_STATIONS_CACHE_JSON_GZ = "https://aviationweather.gov/data/cache/stations.cache.json.gz"
+
+AW_METAR_CACHE_XML_GZ_WWW = "https://www.aviationweather.gov/data/cache/metars.cache.xml.gz"
+AW_STATIONS_CACHE_JSON_GZ_WWW = "https://www.aviationweather.gov/data/cache/stations.cache.json.gz"
+
 AW_CONUS_BBOX = f"{CONUS_MIN_LON},{CONUS_MIN_LAT},{CONUS_MAX_LON},{CONUS_MAX_LAT}"
 
+AW_HEADERS = {
+    "User-Agent": "metar-webapp/1.0 (local; contact=local)",
+    "Accept": "application/json, text/plain, */*",
+}
+AW_TIMEOUT = 60
+
+DEBUG = os.environ.get("METAR_DEBUG", "").strip() not in ("", "0", "false", "False")
+
+
+def _dbg(msg: str) -> None:
+    if DEBUG:
+        print(f"[metar_core] {msg}", file=sys.stderr)
+
+
+# Tune chunk size without editing code:
+#   set -x METAR_IDS_CHUNK_SIZE 100
+DEFAULT_IDS_CHUNK_SIZE = int(os.environ.get("METAR_IDS_CHUNK_SIZE", "100"))
+DEFAULT_IDS_CHUNK_SIZE = max(10, min(250, DEFAULT_IDS_CHUNK_SIZE))
+
+# Optional: request recent window too (harmless if ignored by upstream)
+DEFAULT_METAR_HOURS = os.environ.get("METAR_HOURS", "").strip()
+DEFAULT_METAR_HOURS = DEFAULT_METAR_HOURS if DEFAULT_METAR_HOURS.isdigit() else ""
+
+
+_LAST_METAR_FETCH_DEBUG: Dict[str, object] = {}
+
+
+def get_last_metar_fetch_debug() -> Dict[str, object]:
+    return dict(_LAST_METAR_FETCH_DEBUG)
+
+
+def _set_fetch_debug(**kwargs) -> None:
+    _LAST_METAR_FETCH_DEBUG.clear()
+    _LAST_METAR_FETCH_DEBUG.update(kwargs)
+
+
+def _swap_bbox_string(bbox: str) -> str:
+    parts = [p.strip() for p in bbox.split(",")]
+    if len(parts) != 4:
+        return bbox
+    a, b, c, d = parts
+    return f"{b},{a},{d},{c}"
+
+
+def _aw_get_json_list(
+    session: requests.Session,
+    url: str,
+    params: dict,
+    *,
+    retry_bbox_swap: bool = True,
+) -> List[dict]:
+    for k, v in AW_HEADERS.items():
+        session.headers.setdefault(k, v)
+
+    def _do(p: dict) -> requests.Response:
+        return session.get(url, params=p, timeout=AW_TIMEOUT)
+
+    resp = _do(params)
+
+    if resp.status_code == 204:
+        return []
+
+    if retry_bbox_swap and "bbox" in params:
+        if resp.status_code == 400:
+            swapped = dict(params)
+            swapped["bbox"] = _swap_bbox_string(str(params["bbox"]))
+            resp2 = _do(swapped)
+            if resp2.status_code == 204:
+                return []
+            resp2.raise_for_status()
+            txt2 = (resp2.text or "").strip()
+            if not txt2:
+                return []
+            data2 = resp2.json()
+            return data2 if isinstance(data2, list) else []
+
+        resp.raise_for_status()
+        txt = (resp.text or "").strip()
+        if not txt:
+            return []
+        data = resp.json()
+
+        if isinstance(data, list) and len(data) == 0:
+            swapped = dict(params)
+            swapped["bbox"] = _swap_bbox_string(str(params["bbox"]))
+            resp2 = _do(swapped)
+            if resp2.status_code == 204:
+                return []
+            resp2.raise_for_status()
+            txt2 = (resp2.text or "").strip()
+            if not txt2:
+                return []
+            data2 = resp2.json()
+            return data2 if isinstance(data2, list) else []
+
+        return data if isinstance(data, list) else []
+
+    resp.raise_for_status()
+    txt = (resp.text or "").strip()
+    if not txt:
+        return []
+    data = resp.json()
+    return data if isinstance(data, list) else []
+
+
+def _http_get_bytes(session: requests.Session, url: str) -> bytes:
+    for k, v in AW_HEADERS.items():
+        session.headers.setdefault(k, v)
+    r = session.get(url, timeout=AW_TIMEOUT)
+    r.raise_for_status()
+    return r.content
+
+
+def _gunzip(data: bytes) -> bytes:
+    return gzip.decompress(data)
+
+
+def _looks_like_real_metar_cache(xml_bytes: bytes) -> bool:
+    if len(xml_bytes) < 10_000:
+        return False
+    head = xml_bytes[:500].lower()
+    if b"<html" in head:
+        return False
+    if b"<metar" not in xml_bytes[:200_000].lower():
+        return False
+    return True
+
+
+def _parse_metar_cache_xml_from_url(session: requests.Session, url: str) -> List[dict]:
+    raw_gz = _http_get_bytes(session, url)
+    xml_bytes = _gunzip(raw_gz)
+
+    if not _looks_like_real_metar_cache(xml_bytes):
+        _dbg(f"METAR cache invalid from {url}: unzipped_bytes={len(xml_bytes)}")
+        return []
+
+    root = ET.fromstring(xml_bytes)
+    out: List[dict] = []
+    for m in root.iterfind(".//METAR"):
+        raw_text = (m.findtext("raw_text") or "").strip()
+        station = (m.findtext("station_id") or "").strip()
+        lat = m.findtext("latitude")
+        lon = m.findtext("longitude")
+        obs_time = (m.findtext("observation_time") or "").strip()
+
+        if not raw_text or not station:
+            continue
+
+        obj = {"rawOb": raw_text, "icaoId": station}
+        try:
+            if lat and lon:
+                obj["lat"] = float(lat)
+                obj["lon"] = float(lon)
+        except Exception:
+            pass
+        if obs_time:
+            obj["observation_time"] = obs_time
+
+        out.append(obj)
+    return out
+
+
+def _parse_taf_cache_xml_gz(session: requests.Session) -> List[dict]:
+    raw = _gunzip(_http_get_bytes(session, AW_TAF_CACHE_XML_GZ))
+    root = ET.fromstring(raw)
+    out: List[dict] = []
+    for taf in root.iterfind(".//TAF"):
+        raw_text = (taf.findtext("raw_text") or "").strip()
+        station = (taf.findtext("station_id") or taf.findtext("icao_id") or "").strip()
+        lat = taf.findtext("latitude")
+        lon = taf.findtext("longitude")
+        if not raw_text or not station:
+            continue
+        obj = {"raw": raw_text, "icaoId": station}
+        try:
+            if lat and lon:
+                obj["lat"] = float(lat)
+                obj["lon"] = float(lon)
+        except Exception:
+            pass
+        out.append(obj)
+    return out
+
+
+def _parse_aircraftreports_xml_gz(session: requests.Session, hours: int = 24) -> List[dict]:
+    raw = _gunzip(_http_get_bytes(session, AW_AIRCRAFTREP_XML_GZ))
+    root = ET.fromstring(raw)
+    cutoff = datetime.now(UTC).timestamp() - (int(hours) * 3600)
+
+    out: List[dict] = []
+    for rep in root.iterfind(".//AircraftReport"):
+        raw_text = (rep.findtext("raw_text") or "").strip()
+        if not raw_text:
+            continue
+        if raw_text.lstrip().startswith("ARP "):
+            continue
+
+        lat = rep.findtext("latitude")
+        lon = rep.findtext("longitude")
+        obs_time = (rep.findtext("observation_time") or rep.findtext("report_time") or "").strip()
+
+        latf = lonf = None
+        try:
+            if lat and lon:
+                latf, lonf = float(lat), float(lon)
+        except Exception:
+            latf = lonf = None
+
+        if latf is not None and lonf is not None and not is_in_conus(latf, lonf):
+            continue
+
+        if obs_time:
+            try:
+                dt = datetime.fromisoformat(obs_time.replace("Z", "+00:00"))
+                if dt.timestamp() < cutoff:
+                    continue
+            except Exception:
+                pass
+
+        obj = {"raw": raw_text}
+        if latf is not None and lonf is not None:
+            obj["lat"] = latf
+            obj["lon"] = lonf
+        if obs_time:
+            obj["observation_time"] = obs_time
+
+        out.append(obj)
+
+    return out
+
+
+def _load_conus_k_station_ids(session: requests.Session) -> List[str]:
+    urls = [AW_STATIONS_CACHE_JSON_GZ, AW_STATIONS_CACHE_JSON_GZ_WWW]
+    data_obj = None
+    last_err: Optional[Exception] = None
+
+    for u in urls:
+        try:
+            raw = _gunzip(_http_get_bytes(session, u))
+            if len(raw) < 5_000:
+                _dbg(f"Stations cache tiny from {u}: unzipped_bytes={len(raw)}")
+                continue
+            data_obj = json.loads(raw.decode("utf-8", errors="replace"))
+            break
+        except Exception as e:
+            last_err = e
+
+    if data_obj is None:
+        if last_err:
+            raise last_err
+        raise RuntimeError("Failed to load stations cache")
+
+    stations = None
+    if isinstance(data_obj, dict):
+        if isinstance(data_obj.get("data"), list):
+            stations = data_obj["data"]
+        elif isinstance(data_obj.get("Station"), list):
+            stations = data_obj["Station"]
+        elif isinstance(data_obj.get("stations"), list):
+            stations = data_obj["stations"]
+
+    if not isinstance(stations, list):
+        stations = []
+
+    ids: List[str] = []
+    for st in stations:
+        if not isinstance(st, dict):
+            continue
+        sid = (st.get("station_id") or st.get("icaoId") or st.get("id") or "").strip().upper()
+        if not sid or not sid.startswith("K"):
+            continue
+
+        lat = st.get("latitude") if st.get("latitude") is not None else st.get("lat")
+        lon = st.get("longitude") if st.get("longitude") is not None else st.get("lon")
+
+        try:
+            latf = float(lat)
+            lonf = float(lon)
+        except Exception:
+            continue
+
+        if is_in_conus(latf, lonf):
+            ids.append(sid)
+
+    seen = set()
+    out: List[str] = []
+    for sid in ids:
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+
+    _dbg(f"Stations-derived ids: {len(out)}")
+    return out
+
+
+def _fetch_metars_by_ids_chunked(session: requests.Session, ids: List[str], chunk_size: int) -> Tuple[List[dict], int, int]:
+    out: List[dict] = []
+    ok = 0
+    bad = 0
+
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i : i + chunk_size]
+        params = {"format": "json", "mostRecent": "true", "ids": ",".join(chunk)}
+        if DEFAULT_METAR_HOURS:
+            params["hours"] = DEFAULT_METAR_HOURS
+
+        try:
+            data = _aw_get_json_list(session, AW_METAR_URL, params, retry_bbox_swap=False)
+            if data:
+                out.extend(data)
+            ok += 1
+        except Exception as e:
+            bad += 1
+            _dbg(f"METAR ids chunk failed (size={len(chunk)}): {e!r}")
+
+    return out, ok, bad
+
+
+def _taf_station_ids_conus_k(tafs: List[dict]) -> List[str]:
+    ids: List[str] = []
+    for t in tafs:
+        sid = (t.get("icaoId") or t.get("station_id") or t.get("stationId") or "").strip().upper()
+        if not sid.startswith("K"):
+            continue
+        lat = t.get("lat")
+        lon = t.get("lon")
+        if lat is not None and lon is not None:
+            try:
+                if not is_in_conus(float(lat), float(lon)):
+                    continue
+            except Exception:
+                pass
+        ids.append(sid)
+
+    seen = set()
+    out: List[str] = []
+    for sid in ids:
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+    return out
+
+
+def aw_fetch_taf_most_recent_global(session: requests.Session) -> List[dict]:
+    params = {"format": "json", "bbox": AW_CONUS_BBOX, "mostRecent": "true"}
+    try:
+        data = _aw_get_json_list(session, AW_TAF_URL, params, retry_bbox_swap=True)
+        if data:
+            return data
+    except Exception as e:
+        _dbg(f"TAF API failed: {e!r}")
+    try:
+        return _parse_taf_cache_xml_gz(session)
+    except Exception as e:
+        _dbg(f"TAF cache failed: {e!r}")
+        return []
+
+
+def aw_fetch_pirep_last_hours_global(session: requests.Session, hours: int = 24) -> List[dict]:
+    params = {"format": "json", "bbox": AW_CONUS_BBOX, "hours": str(int(hours))}
+    try:
+        data = _aw_get_json_list(session, AW_PIREP_URL, params, retry_bbox_swap=True)
+        if data:
+            return data
+    except Exception as e:
+        _dbg(f"PIREP API failed: {e!r}")
+    try:
+        return _parse_aircraftreports_xml_gz(session, hours=hours)
+    except Exception as e:
+        _dbg(f"PIREP cache failed: {e!r}")
+        return []
+
+
+def aw_fetch_global_most_recent(session: requests.Session) -> List[dict]:
+    start = time.time()
+    chunk_size = DEFAULT_IDS_CHUNK_SIZE
+
+    bbox_err = None
+    try:
+        params = {"format": "json", "bbox": AW_CONUS_BBOX, "mostRecent": "true"}
+        data = _aw_get_json_list(session, AW_METAR_URL, params, retry_bbox_swap=True)
+        if data:
+            _set_fetch_debug(
+                strategy="api_bbox",
+                fetched=len(data),
+                seconds=round(time.time() - start, 3),
+                ids_chunk_size=chunk_size,
+            )
+            return data
+    except Exception as e:
+        bbox_err = repr(e)
+        _dbg(f"METAR bbox failed: {e!r}")
+
+    taf_err = None
+    try:
+        tafs = aw_fetch_taf_most_recent_global(session)
+        ids = _taf_station_ids_conus_k(tafs)
+        if ids:
+            metars, ok, bad = _fetch_metars_by_ids_chunked(session, ids, chunk_size=chunk_size)
+            if metars:
+                _set_fetch_debug(
+                    strategy="taf_ids",
+                    taf_ids=len(ids),
+                    chunks_ok=ok,
+                    chunks_failed=bad,
+                    fetched=len(metars),
+                    seconds=round(time.time() - start, 3),
+                    bbox_err=bbox_err,
+                    ids_chunk_size=chunk_size,
+                    metar_hours=DEFAULT_METAR_HOURS or None,
+                )
+                return metars
+    except Exception as e:
+        taf_err = repr(e)
+        _dbg(f"METAR TAF-derived ids failed: {e!r}")
+
+    stations_err = None
+    try:
+        ids = _load_conus_k_station_ids(session)
+        if ids:
+            metars, ok, bad = _fetch_metars_by_ids_chunked(session, ids, chunk_size=chunk_size)
+            if metars:
+                _set_fetch_debug(
+                    strategy="stations_ids",
+                    station_ids=len(ids),
+                    chunks_ok=ok,
+                    chunks_failed=bad,
+                    fetched=len(metars),
+                    seconds=round(time.time() - start, 3),
+                    bbox_err=bbox_err,
+                    taf_err=taf_err,
+                    ids_chunk_size=chunk_size,
+                    metar_hours=DEFAULT_METAR_HOURS or None,
+                )
+                return metars
+    except Exception as e:
+        stations_err = repr(e)
+        _dbg(f"METAR stations cache ids failed: {e!r}")
+
+    cache1_err = None
+    try:
+        data = _parse_metar_cache_xml_from_url(session, AW_METAR_CACHE_XML_GZ)
+        if data:
+            _set_fetch_debug(
+                strategy="xml_cache_primary",
+                fetched=len(data),
+                seconds=round(time.time() - start, 3),
+                bbox_err=bbox_err,
+                taf_err=taf_err,
+                stations_err=stations_err,
+                ids_chunk_size=chunk_size,
+            )
+            return data
+    except Exception as e:
+        cache1_err = repr(e)
+        _dbg(f"METAR cache primary failed: {e!r}")
+
+    cache2_err = None
+    try:
+        data = _parse_metar_cache_xml_from_url(session, AW_METAR_CACHE_XML_GZ_WWW)
+        if data:
+            _set_fetch_debug(
+                strategy="xml_cache_www",
+                fetched=len(data),
+                seconds=round(time.time() - start, 3),
+                bbox_err=bbox_err,
+                taf_err=taf_err,
+                stations_err=stations_err,
+                cache1_err=cache1_err,
+                ids_chunk_size=chunk_size,
+            )
+            return data
+    except Exception as e:
+        cache2_err = repr(e)
+        _dbg(f"METAR cache www failed: {e!r}")
+
+    _set_fetch_debug(
+        strategy="none",
+        fetched=0,
+        seconds=round(time.time() - start, 3),
+        bbox_err=bbox_err,
+        taf_err=taf_err,
+        stations_err=stations_err,
+        cache1_err=cache1_err,
+        cache2_err=cache2_err,
+        ids_chunk_size=chunk_size,
+        metar_hours=DEFAULT_METAR_HOURS or None,
+    )
+    return []
+
+
+def filter_conus_from_aw(metars: List[dict]) -> List[dict]:
+    out: List[dict] = []
+    for m in metars:
+        icao = (m.get("icaoId") or "").strip().upper()
+        lat = m.get("lat")
+        lon = m.get("lon")
+        if not icao or lat is None or lon is None:
+            continue
+        if not icao.startswith("K"):
+            continue
+        try:
+            latf, lonf = float(lat), float(lon)
+        except Exception:
+            continue
+        if is_in_conus(latf, lonf):
+            out.append(m)
+    return out
+
+
 # -----------------------------
-# Tokenization + difficulty weighting (METAR)
+# Tokenization + scoring (unchanged)
 # -----------------------------
-DROP_TOKENS = {"METAR"}  # keep SPECI/RMK
+DROP_TOKENS = {"METAR"}
 
 RE_RVR = re.compile(r"^R\d{2}[LRC]?/")
 RE_VV = re.compile(r"^VV\d{3}$")
@@ -50,9 +566,6 @@ RE_TEMP_DEW = re.compile(r"^(M?\d{2})/(M?\d{2})$")
 RE_ALTIM = re.compile(r"^A\d{4}$|^Q\d{4}$")
 RE_CLOUD = re.compile(r"^(FEW|SCT|BKN|OVC)\d{3}(CB|TCU)?$")
 RE_WX = re.compile(r"^(\+|-)?(VC)?[A-Z]{2,6}$")
-RE_SECTOR_VIS = re.compile(r"^\d{4}[A-Z]{1,3}$")
-RE_RWY_DESIG = re.compile(r"^RWY\d{2}[LRC]?$")
-RE_FROPA = re.compile(r"^PRES(FR|RR)$")
 
 HARD_RMK_KEYWORDS = {
     "TORNADO", "FUNNEL", "WATERSPOUT",
@@ -70,7 +583,6 @@ DIFFICULTY_WEIGHT = {
     "VV": 5.0,
     "WIND_SHEAR": 5.0,
     "RUNWAY_STATE": 4.0,
-    "SECTOR_VIS": 3.5,
     "VAR_WIND_DIR": 2.5,
     "WX": 3.0,
     "RMK_MARKER": 0.5,
@@ -85,16 +597,11 @@ DIFFICULTY_WEIGHT = {
 LOW_CEILING_BONUS = 0.8
 
 
-def is_in_conus(lat: float, lon: float) -> bool:
-    return (CONUS_MIN_LAT <= lat <= CONUS_MAX_LAT) and (CONUS_MIN_LON <= lon <= CONUS_MAX_LON)
-
-
 def classify_token(tok: str) -> str:
     if RE_RVR.match(tok): return "RVR"
     if RE_VV.match(tok): return "VV"
     if RE_WIND_SHEAR.match(tok): return "WIND_SHEAR"
     if RE_RUNWAY_STATE.match(tok): return "RUNWAY_STATE"
-    if RE_SECTOR_VIS.match(tok): return "SECTOR_VIS"
     if RE_VAR_WIND_DIR.match(tok): return "VAR_WIND_DIR"
     if tok == "RMK": return "RMK_MARKER"
     if RE_WX.match(tok): return "WX"
@@ -115,7 +622,6 @@ def normalize_token(tok: str) -> str:
         if "G" in tok: return "WIND_GUST"
         return "WIND"
     if cls == "VIS": return "VIS"
-    if cls == "SECTOR_VIS": return "SECTOR_VIS"
     if cls == "VAR_WIND_DIR": return "VAR_WIND_DIR"
     if cls == "CLOUD":
         m = RE_CLOUD.match(tok)
@@ -128,12 +634,7 @@ def normalize_token(tok: str) -> str:
     if cls == "WIND_SHEAR": return "WIND_SHEAR"
     if cls == "RUNWAY_STATE": return "RUNWAY_STATE"
     if cls == "RMK_MARKER": return "RMK"
-    if cls == "WX": return tok  # keep exact wx strings
-
-    if RE_RWY_DESIG.match(tok): return "RWY_DESIG"
-    if RE_FROPA.match(tok): return "PRES_TREND"
-    if tok.startswith("SLP") and len(tok) == 6 and tok[3:].isdigit(): return "SLP"
-    if re.match(r"^\d{3,5}/\d{4}$", tok): return "WIND_TIME"
+    if cls == "WX": return tok
     return tok
 
 
@@ -141,19 +642,16 @@ def token_difficulty(tok: str) -> float:
     cls = classify_token(tok)
     if cls == "OTHER" and tok in HARD_RMK_KEYWORDS:
         return 4.0
-
     base = DIFFICULTY_WEIGHT.get(cls, 1.0)
-
     if cls == "CLOUD" and LOW_CEILING_BONUS > 0:
         m = RE_CLOUD.match(tok)
         if m:
             try:
-                h = int(tok[3:6])  # hundreds of feet
+                h = int(tok[3:6])
                 if h <= 5 and m.group(1) in ("BKN", "OVC"):
                     base = base + LOW_CEILING_BONUS
             except Exception:
                 pass
-
     return base
 
 
@@ -168,9 +666,6 @@ def tokenize_metar(raw: str) -> List[str]:
     return [p for p in parts if p and p not in DROP_TOKENS]
 
 
-# -----------------------------
-# Generic seasonal rarity model
-# -----------------------------
 @dataclass
 class SeasonalRarityModel:
     alpha: float
@@ -186,35 +681,11 @@ class SeasonalRarityModel:
             c = self.counts_all.get(tok, 0)
             p = (c + self.alpha) / (self.total_all + self.alpha * self.vocab_all)
             return -math.log(p)
-
-        def mprev(mm: int) -> str:
-            return str(12 if mm == 1 else mm - 1)
-
-        def mnext(mm: int) -> str:
-            return str(1 if mm == 12 else mm + 1)
-
-        mp = mprev(month)
-        mn = mnext(month)
-
         c_m = self.counts_by_month[m].get(tok, 0)
         t_m = self.totals_by_month.get(m, 0)
-
-        if neighbor_smooth > 0:
-            c_p = self.counts_by_month.get(mp, {}).get(tok, 0)
-            c_n = self.counts_by_month.get(mn, {}).get(tok, 0)
-            t_p = self.totals_by_month.get(mp, 0)
-            t_n = self.totals_by_month.get(mn, 0)
-
-            s = max(0.0, min(1.0, neighbor_smooth))
-            c_eff = (1.0 - s) * c_m + (s / 2.0) * (c_p + c_n)
-            t_eff = (1.0 - s) * t_m + (s / 2.0) * (t_p + t_n)
-        else:
-            c_eff = float(c_m)
-            t_eff = float(t_m)
-
-        p = (c_eff + self.alpha) / (t_eff + self.alpha * self.vocab_all) if (t_eff > 0) else \
+        p = (c_m + self.alpha) / (t_m + self.alpha * self.vocab_all) if t_m > 0 else (
             (self.counts_all.get(tok, 0) + self.alpha) / (self.total_all + self.alpha * self.vocab_all)
-
+        )
         return -math.log(p)
 
 
@@ -240,9 +711,6 @@ def load_model(path: str) -> SeasonalRarityModel:
     )
 
 
-# -----------------------------
-# Scores for each product
-# -----------------------------
 RE_SPLIT = re.compile(r"\s+")
 
 
@@ -281,108 +749,12 @@ def pirep_score(text: str, model: SeasonalRarityModel, length_weight: float, mon
     return score
 
 
-# -----------------------------
-# AviationWeather fetchers
-# -----------------------------
-def aw_fetch_global_most_recent(session: requests.Session) -> List[dict]:
-    params = {"format": "json", "bbox": AW_GLOBAL_BBOX, "mostRecent": "true"}
-    r = session.get(AW_METAR_URL, params=params, timeout=60)
-    r.raise_for_status()
-    if not r.text.strip():
-        return []
-    return r.json()
-
-
-def filter_conus_from_aw(metars: List[dict]) -> List[dict]:
-    out = []
-    for m in metars:
-        icao = (m.get("icaoId") or "").strip()
-        lat = m.get("lat")
-        lon = m.get("lon")
-        if not icao or lat is None or lon is None:
-            continue
-        if not icao.startswith("K"):
-            continue
-        try:
-            latf, lonf = float(lat), float(lon)
-        except Exception:
-            continue
-        if is_in_conus(latf, lonf):
-            out.append(m)
-    return out
-
-
-def aw_fetch_taf_most_recent_global(session: requests.Session) -> List[dict]:
-    params = {"format": "json", "bbox": AW_GLOBAL_BBOX, "mostRecent": "true"}
-    r = session.get(AW_TAF_URL, params=params, timeout=60)
-    r.raise_for_status()
-    if not r.text.strip():
-        return []
-    return r.json()
-
-
-def filter_conus_taf_aw(tafs: List[dict]) -> List[dict]:
-    """
-    Keep CONUS TAFs:
-      - station id starts with 'K'
-      - lat/lon exist and inside CONUS bounds
-    """
-    out: List[dict] = []
-    for t in tafs:
-        station = (t.get("stationId") or t.get("icaoId") or t.get("station") or "").strip()
-        lat = t.get("lat")
-        lon = t.get("lon")
-        if not station or lat is None or lon is None:
-            continue
-        if not station.startswith("K"):
-            continue
-        try:
-            latf, lonf = float(lat), float(lon)
-        except Exception:
-            continue
-        if is_in_conus(latf, lonf):
-            out.append(t)
-    return out
-
-
-def aw_fetch_pirep_last_hours_global(session: requests.Session, hours: int = 24) -> List[dict]:
-    params = {"format": "json", "bbox": AW_GLOBAL_BBOX, "hours": str(int(hours))}
-    r = session.get(AW_PIREP_URL, params=params, timeout=60)
-    r.raise_for_status()
-    if not r.text.strip():
-        return []
-    return r.json()
-
-
-def filter_conus_pirep_aw(pireps: List[dict]) -> List[dict]:
-    """
-    Keep only PIREPs with lat/lon inside CONUS bounds.
-    This removes oceanic ARPs automatically.
-    """
-    out: List[dict] = []
-    for p in pireps:
-        lat = p.get("lat")
-        lon = p.get("lon")
-        if lat is None or lon is None:
-            continue
-        try:
-            latf, lonf = float(lat), float(lon)
-        except Exception:
-            continue
-        if is_in_conus(latf, lonf):
-            out.append(p)
-    return out
-
-
-# -----------------------------
-# Optional CLI sanity check
-# -----------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="metar_core helpers")
-    ap.add_argument("--health", action="store_true", help="Quick import/test")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--health", action="store_true")
     args = ap.parse_args()
     if args.health:
-        print("ok")
+        print("ok", datetime.now(UTC).isoformat())
 
 
 if __name__ == "__main__":
