@@ -1,190 +1,160 @@
+# backend/history_store.py
 from __future__ import annotations
 
-import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-# Rolling window: 12 months ~ 365 days
-WINDOW_SECONDS = int(os.getenv("HISTORY_WINDOW_SECONDS", str(365 * 24 * 3600)))
-
-# Hard cap per product (default 50)
-MAX_ROWS_PER_PRODUCT = int(os.getenv("HISTORY_MAX_ROWS_PER_PRODUCT", "50"))
-
-# DB location
-DB_PATH = Path(os.getenv("HISTORY_DB_PATH", Path(__file__).resolve().parent / "data" / "history.db"))
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-def _connect() -> sqlite3.Connection:
-    con = sqlite3.connect(str(DB_PATH))
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    return con
+@dataclass(frozen=True)
+class Row:
+    station: str
+    score: float
+    raw_text: str
+    ts: float
 
 
-def init_db() -> None:
-    with _connect() as con:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS history (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              product TEXT NOT NULL,
-              station TEXT NOT NULL,
-              text TEXT NOT NULL,
-              score REAL NOT NULL,
-              lat REAL,
-              lon REAL,
-              obs_time_utc TEXT,
-              first_seen_unix INTEGER NOT NULL,
-              last_seen_unix INTEGER NOT NULL,
-              seen_count INTEGER NOT NULL DEFAULT 1,
-              UNIQUE(product, station, text)
-            );
-            """
-        )
-        con.execute("CREATE INDEX IF NOT EXISTS idx_history_product_score ON history(product, score DESC);")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_history_last_seen ON history(last_seen_unix);")
-
-
-def _now_unix() -> int:
-    return int(time.time())
-
-
-def _cutoff_unix(now_unix: int) -> int:
-    return now_unix - WINDOW_SECONDS
-
-
-def prune(now_unix: Optional[int] = None) -> None:
+class HistoryStore:
     """
-    Prune by:
-      1) rolling window (last_seen within ~12 months)
-      2) hard cap per product (keep top MAX_ROWS_PER_PRODUCT by score)
+    Stores "top rows" per product over time and exposes a 12-month rolling
+    top list.
+
+    Design goal: keep it simple, deterministic, and fast enough for small apps.
     """
-    now = _now_unix() if now_unix is None else int(now_unix)
-    cutoff = _cutoff_unix(now)
 
-    with _connect() as con:
-        # 1) Age prune
-        con.execute("DELETE FROM history WHERE last_seen_unix < ?;", (cutoff,))
+    def __init__(self, db_path: str | Path):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
 
-        # 2) Cap prune per product
-        products = [r[0] for r in con.execute("SELECT DISTINCT product FROM history;").fetchall()]
-        for p in products:
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(str(self.db_path))
+        con.row_factory = sqlite3.Row
+        return con
+
+    def _init_db(self) -> None:
+        with self._connect() as con:
             con.execute(
                 """
-                DELETE FROM history
-                WHERE id IN (
-                  SELECT id FROM history
-                  WHERE product = ?
-                  ORDER BY score DESC
-                  LIMIT -1 OFFSET ?
+                CREATE TABLE IF NOT EXISTS history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product TEXT NOT NULL,
+                    station TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    raw_text TEXT NOT NULL,
+                    ts REAL NOT NULL
                 );
-                """,
-                (p, MAX_ROWS_PER_PRODUCT),
-            )
-
-
-def offer_rows(product: str, rows: List[Dict[str, Any]], now_unix: Optional[int] = None) -> None:
-    """
-    Insert/update deduped (product, station, text).
-    Keeps max score seen; updates last_seen/seen_count.
-    """
-    if not rows:
-        return
-
-    now = _now_unix() if now_unix is None else int(now_unix)
-
-    cleaned: List[Tuple[str, str, str, float, Optional[float], Optional[float], Optional[str]]] = []
-    for r in rows:
-        station = str(r.get("station") or r.get("icaoId") or "----").strip() or "----"
-        text = str(r.get("text") or r.get("rawOb") or r.get("raw") or "").strip()
-        if not text:
-            continue
-
-        score = r.get("score")
-        try:
-            score_f = float(score)
-        except Exception:
-            continue
-
-        lat = r.get("lat")
-        lon = r.get("lon")
-        lat_f = float(lat) if isinstance(lat, (int, float)) else None
-        lon_f = float(lon) if isinstance(lon, (int, float)) else None
-
-        obs_time_utc = r.get("obs_time_utc")
-        obs_time_utc = str(obs_time_utc).strip() if obs_time_utc else None
-
-        cleaned.append((product, station, text, score_f, lat_f, lon_f, obs_time_utc))
-
-    if not cleaned:
-        return
-
-    init_db()
-
-    with _connect() as con:
-        for (p, station, text, score, lat, lon, obs_time_utc) in cleaned:
-            con.execute(
                 """
-                INSERT INTO history (product, station, text, score, lat, lon, obs_time_utc, first_seen_unix, last_seen_unix, seen_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(product, station, text) DO UPDATE SET
-                  last_seen_unix = excluded.last_seen_unix,
-                  seen_count = history.seen_count + 1,
-                  score = CASE WHEN excluded.score > history.score THEN excluded.score ELSE history.score END,
-                  lat = COALESCE(excluded.lat, history.lat),
-                  lon = COALESCE(excluded.lon, history.lon),
-                  obs_time_utc = COALESCE(excluded.obs_time_utc, history.obs_time_utc);
-                """,
-                (p, station, text, score, lat, lon, obs_time_utc, now, now),
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_product_ts ON history(product, ts);"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_product_score ON history(product, score);"
+            )
+            con.commit()
+
+    def _cutoff_ts(self, months: int = 12) -> float:
+        # months ~= 30.44 days each
+        return time.time() - (months * 30.44 * 24 * 3600)
+
+    def offer_rows(self, product: str, rows: Iterable[Dict[str, Any]]) -> None:
+        """
+        Insert rows for a given product.
+        Expected row keys (best effort):
+          - station (or icao)
+          - score (float)
+          - raw_text (or text)
+        """
+        now = time.time()
+        payload: List[Tuple[str, str, float, str, float]] = []
+
+        for r in rows:
+            station = (r.get("station") or r.get("icao") or "").strip()
+            raw_text = (r.get("raw_text") or r.get("text") or "").strip()
+            score_val = r.get("score")
+
+            if not station or score_val is None:
+                continue
+
+            try:
+                score = float(score_val)
+            except Exception:
+                continue
+
+            payload.append((product, station, score, raw_text, now))
+
+        if not payload:
+            return
+
+        with self._connect() as con:
+            con.executemany(
+                "INSERT INTO history(product, station, score, raw_text, ts) VALUES(?,?,?,?,?)",
+                payload,
             )
 
-    prune(now_unix=now)
+            # Prune old records beyond 12 months
+            cutoff = self._cutoff_ts(12)
+            con.execute("DELETE FROM history WHERE ts < ?", (cutoff,))
+            con.commit()
 
+    def get_top(self, product: str, top: int = 10) -> List[Dict[str, Any]]:
+        """
+        Returns a 12-month rolling top list for a product, aggregated by station.
 
-def get_top(product: str, top: int = 25, now_unix: Optional[int] = None) -> Dict[str, Any]:
-    init_db()
+        Strategy:
+        - consider last 12 months of rows
+        - for each station, take max(score) and the newest raw_text for that station
+        - sort by max(score) desc
+        """
+        cutoff = self._cutoff_ts(12)
 
-    now = _now_unix() if now_unix is None else int(now_unix)
-    cutoff = _cutoff_unix(now)
+        # Clamp top to a reasonable range
+        try:
+            top_n = int(top)
+        except Exception:
+            top_n = 10
+        top_n = max(1, min(top_n, 200))
 
-    with _connect() as con:
-        rows = con.execute(
-            """
-            SELECT product, station, score, text, lat, lon, obs_time_utc, first_seen_unix, last_seen_unix, seen_count
-            FROM history
-            WHERE product = ? AND last_seen_unix >= ?
-            ORDER BY score DESC
-            LIMIT ?;
-            """,
-            (product, cutoff, int(top)),
-        ).fetchall()
+        with self._connect() as con:
+            # max score per station in last 12 months
+            # and pick latest raw_text via correlated subquery on ts
+            cur = con.execute(
+                """
+                SELECT
+                    h.station AS station,
+                    MAX(h.score) AS score,
+                    (
+                        SELECT h2.raw_text
+                        FROM history h2
+                        WHERE h2.product = h.product
+                          AND h2.station = h.station
+                          AND h2.ts >= ?
+                        ORDER BY h2.ts DESC
+                        LIMIT 1
+                    ) AS raw_text,
+                    MAX(h.ts) AS ts
+                FROM history h
+                WHERE h.product = ?
+                  AND h.ts >= ?
+                GROUP BY h.station
+                ORDER BY score DESC
+                LIMIT ?;
+                """,
+                (cutoff, product, cutoff, top_n),
+            )
+            rows = cur.fetchall()
 
-    out_rows = []
-    for (p, station, score, text, lat, lon, obs_time_utc, first_seen_unix, last_seen_unix, seen_count) in rows:
-        out_rows.append(
-            {
-                "product": p,
-                "station": station,
-                "score": float(score),
-                "text": text,
-                "lat": lat,
-                "lon": lon,
-                "obs_time_utc": obs_time_utc,
-                "first_seen_unix": int(first_seen_unix),
-                "last_seen_unix": int(last_seen_unix),
-                "seen_count": int(seen_count),
-            }
-        )
-
-    return {
-        "generated_at_unix": now,
-        "product": product,
-        "window_seconds": WINDOW_SECONDS,
-        "max_rows_per_product": MAX_ROWS_PER_PRODUCT,
-        "top": int(top),
-        "count": len(out_rows),
-        "rows": out_rows,
-    }
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "station": r["station"],
+                    "score": float(r["score"]) if r["score"] is not None else 0.0,
+                    "raw_text": r["raw_text"] or "",
+                    "ts": float(r["ts"]) if r["ts"] is not None else 0.0,
+                }
+            )
+        return out
