@@ -6,7 +6,7 @@ import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import requests
 from fastapi import FastAPI, Query, Request
@@ -81,12 +81,19 @@ HISTORY_DB_PATH = Path(os.getenv("HISTORY_DB_PATH", str(DEFAULT_DB_PATH)))
 # ----------------------------
 # History adapter (supports your history_store.py regardless of API shape)
 # ----------------------------
+HistoryResult = Union[List[Dict[str, Any]], Dict[str, Any]]
+
+
 class _HistoryAdapter:
     """
     Works with either:
       - hs.HistoryStore(db_path).offer_rows(product, rows) / .get_top(product, top=...)
       - module-level functions offer_rows / get_top
       - module-level functions with similar names (add_rows, record_rows, top, etc.)
+
+    NOTE:
+      - Some implementations return a dict payload like {"rows": [...], ...}
+      - Others return list[dict] directly
     """
 
     def __init__(self) -> None:
@@ -116,7 +123,7 @@ class _HistoryAdapter:
                 except Exception:
                     return
 
-    def get_top(self, product: str, top: int) -> List[Dict[str, Any]]:
+    def get_top(self, product: str, top: int) -> HistoryResult:
         # class-based
         if self._store is not None and hasattr(self._store, "get_top"):
             try:
@@ -183,6 +190,24 @@ def _cached_fetch(cache: Dict[str, Any], ttl: int, fetch_fn):
     cache["ts"] = now
     cache["data"] = data
     return data
+
+
+# ----------------------------
+# History row normalization
+# ----------------------------
+def _ensure_text_key(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Frontend expects r.text (it filters out rows without it).
+    Many history stores use raw_text instead.
+    Ensure both exist.
+    """
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rr = dict(r)
+        if "text" not in rr:
+            rr["text"] = rr.get("raw_text") or rr.get("raw") or rr.get("report") or ""
+        out.append(rr)
+    return out
 
 
 # ----------------------------
@@ -259,6 +284,7 @@ def api_health():
     }
 
 
+# ✅ FIX: Always return {"rows": [ ... ]} and ensure each row has 'text'
 @app.get("/api/history")
 def api_history(
     product: str = Query(..., description="METAR, TAF, or PIREP"),
@@ -267,7 +293,21 @@ def api_history(
     p = product.strip().upper()
     if p not in {"METAR", "TAF", "PIREP"}:
         return JSONResponse(status_code=400, content={"detail": f"Unknown product: {product}"})
-    return {"rows": history.get_top(p, top=int(top))}
+
+    res = history.get_top(p, top=int(top))
+
+    # If history_store returns a payload dict like {"rows":[...], ...}, normalize its rows and return directly
+    if isinstance(res, dict) and isinstance(res.get("rows"), list):
+        payload = dict(res)
+        payload["rows"] = _ensure_text_key(payload["rows"])
+        return JSONResponse(payload)
+
+    # If it returns list rows, wrap and normalize
+    if isinstance(res, list):
+        rows = _ensure_text_key(res)
+        return JSONResponse({"product": p, "top": int(top), "count": len(rows), "rows": rows})
+
+    return JSONResponse({"product": p, "top": int(top), "count": 0, "rows": []})
 
 
 # ✅ IMPORTANT: radar route must be defined BEFORE any SPA catch-all route
@@ -292,7 +332,6 @@ def radar_tile(z: int, x: int, y: int):
     try:
         png = _fetch_noaa_radar_tile_png(z, x, y, size=256)
     except Exception:
-        # Return stale if available; otherwise signal upstream failure
         if hit is not None:
             _, stale = hit
             return Response(content=stale, media_type="image/png", headers={"Cache-Control": "no-store"})
@@ -332,7 +371,7 @@ def api_leaderboard(
                     "product": "METAR",
                     "station": (m.get("icaoId") or "----").strip(),
                     "score": metar_score(raw, model_metar, length_weight=LENGTH_WEIGHT, month=month),
-                    "text": raw,
+                    "text": raw,  # live endpoints already provide text
                     "lat": m.get("lat"),
                     "lon": m.get("lon"),
                 }
