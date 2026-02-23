@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 from fastapi import FastAPI, Query, Request
@@ -12,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from history_store import offer_rows, get_top
 from metar_core import (
     get_last_metar_fetch_debug,
     load_model,
@@ -38,7 +40,14 @@ PIREP_CACHE_SECONDS = int(os.getenv("PIREP_CACHE_SECONDS", "120"))
 
 API_DEBUG = os.getenv("API_DEBUG", "").strip() not in ("", "0", "false", "False")
 
-app = FastAPI(title="Aviation Weather Leaderboard API", version="0.3.3")
+# Background history refresh
+HISTORY_BG_ENABLED = os.getenv("HISTORY_BG_ENABLED", "1").strip() not in ("", "0", "false", "False")
+HISTORY_REFRESH_SECONDS = int(os.getenv("HISTORY_REFRESH_SECONDS", "120"))
+HISTORY_BG_TOP = int(os.getenv("HISTORY_BG_TOP", "100"))  # fetch/score top N live; store is capped to 50
+HISTORY_BG_CONUS = os.getenv("HISTORY_BG_CONUS", "1").strip() not in ("", "0", "false", "False")
+HISTORY_BG_PIREP_HOURS = int(os.getenv("HISTORY_BG_PIREP_HOURS", "24"))
+
+app = FastAPI(title="Aviation Weather Leaderboard API", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,6 +67,8 @@ model_pirep = load_model(MODEL_PIREP_PATH) if Path(MODEL_PIREP_PATH).exists() el
 _cache_metar: Dict[str, Any] = {"ts": 0.0, "data": None}
 _cache_taf: Dict[str, Any] = {"ts": 0.0, "data": None}
 _cache_pirep: Dict[str, Any] = {"ts": 0.0, "data": None, "hours": None}
+
+_bg_task: Optional[asyncio.Task] = None
 
 
 def _is_nonempty(data: Any) -> bool:
@@ -104,36 +115,10 @@ def _metar_fetch_with_retry():
     return {"data": data2, "attempt_used": 2}
 
 
-@app.get("/api/health")
-def health():
-    return {
-        "ok": True,
-        "models": {
-            "metar": str(Path(MODEL_METAR_PATH).resolve()),
-            "taf": str(Path(MODEL_TAF_PATH).resolve()) if model_taf else None,
-            "pirep": str(Path(MODEL_PIREP_PATH).resolve()) if model_pirep else None,
-        },
-    }
-
-
-@app.get("/api/leaderboard")
-def leaderboard(
-    top: int = Query(25, ge=1, le=200),
-    conus: bool = Query(True),
-):
-    last_attempt_used = None
-
-    def _fetch():
-        nonlocal last_attempt_used
-        result = _metar_fetch_with_retry()
-        last_attempt_used = result.get("attempt_used")
-        return result.get("data")
-
-    metars = _cached_fetch(_cache_metar, CACHE_SECONDS, _fetch)
-    filtered = filter_conus_from_aw(metars) if conus else metars
-
+def _score_metars(metars, top: int, conus: bool):
     now = datetime.now(UTC)
     month = now.month
+    filtered = filter_conus_from_aw(metars) if conus else metars
 
     rows = []
     for m in (filtered or []):
@@ -164,7 +149,204 @@ def leaderboard(
         )
 
     rows.sort(key=lambda x: x["score"], reverse=True)
-    rows = rows[:top]
+    return now, rows[:top], len(metars) if hasattr(metars, "__len__") else None, len(filtered) if hasattr(filtered, "__len__") else None
+
+
+def _score_tafs(tafs, top: int):
+    if model_taf is None:
+        return None, []
+
+    now = datetime.now(UTC)
+    month = now.month
+
+    rows = []
+    for t in (tafs or []):
+        raw = (t.get("rawTAF") or t.get("rawOb") or t.get("raw") or "").strip()
+        if not raw:
+            continue
+
+        try:
+            latf = float(t.get("lat")) if t.get("lat") is not None else None
+            lonf = float(t.get("lon")) if t.get("lon") is not None else None
+        except Exception:
+            latf, lonf = None, None
+
+        station = (t.get("stationId") or t.get("icaoId") or t.get("station") or "----").strip()
+
+        rows.append(
+            {
+                "product": "TAF",
+                "station": station,
+                "icaoId": station,
+                "score": taf_score(raw, model_taf, length_weight=TAF_LENGTH_WEIGHT, month=month),
+                "text": raw,
+                "raw": raw,
+                "lat": latf,
+                "lon": lonf,
+            }
+        )
+
+    rows.sort(key=lambda x: x["score"], reverse=True)
+    return now, rows[:top]
+
+
+def _score_pireps(pireps, top: int):
+    if model_pirep is None:
+        return None, []
+
+    now = datetime.now(UTC)
+    month = now.month
+
+    rows = []
+    for p in (pireps or []):
+        text = (p.get("raw") or p.get("report") or p.get("text") or p.get("rawOb") or "").strip()
+        if not text:
+            continue
+
+        try:
+            latf = float(p.get("lat")) if p.get("lat") is not None else None
+            lonf = float(p.get("lon")) if p.get("lon") is not None else None
+        except Exception:
+            latf, lonf = None, None
+
+        rows.append(
+            {
+                "product": "PIREP",
+                "station": "PIREP",
+                "icaoId": "PIREP",
+                "score": pirep_score(text, model_pirep, length_weight=PIREP_LENGTH_WEIGHT, month=month),
+                "text": text,
+                "raw": text,
+                "lat": latf,
+                "lon": lonf,
+            }
+        )
+
+    rows.sort(key=lambda x: x["score"], reverse=True)
+    return now, rows[:top]
+
+
+async def _history_background_loop():
+    """
+    Periodically fetch + score live data and offer it to the history store,
+    so /api/history stays updated even without user traffic.
+    """
+    # small startup delay so uvicorn fully boots
+    await asyncio.sleep(1.0)
+
+    while True:
+        started = time.time()
+        try:
+            # Run network+CPU scoring off the event loop
+            await asyncio.to_thread(_history_background_tick)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # swallow errors so the loop keeps running
+            pass
+
+        elapsed = time.time() - started
+        sleep_for = max(5.0, float(HISTORY_REFRESH_SECONDS) - elapsed)
+        await asyncio.sleep(sleep_for)
+
+
+def _history_background_tick():
+    top = int(HISTORY_BG_TOP)
+
+    # METAR
+    try:
+        result = _metar_fetch_with_retry()
+        metars = result.get("data")
+        if _is_nonempty(metars):
+            now, rows, _, _ = _score_metars(metars, top=top, conus=HISTORY_BG_CONUS)
+            offer_rows("METAR", rows)
+    except Exception:
+        pass
+
+    # TAF
+    if model_taf is not None:
+        try:
+            with requests.Session() as session:
+                tafs = aw_fetch_taf_most_recent_global(session)
+            if _is_nonempty(tafs):
+                _, rows = _score_tafs(tafs, top=top)
+                offer_rows("TAF", rows)
+        except Exception:
+            pass
+
+    # PIREP
+    if model_pirep is not None:
+        try:
+            with requests.Session() as session:
+                pireps = aw_fetch_pirep_last_hours_global(session, hours=int(HISTORY_BG_PIREP_HOURS))
+            if _is_nonempty(pireps):
+                _, rows = _score_pireps(pireps, top=top)
+                offer_rows("PIREP", rows)
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+async def _startup():
+    global _bg_task
+    if HISTORY_BG_ENABLED and _bg_task is None:
+        _bg_task = asyncio.create_task(_history_background_loop())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _bg_task
+    if _bg_task is not None:
+        _bg_task.cancel()
+        try:
+            await _bg_task
+        except Exception:
+            pass
+        _bg_task = None
+
+
+@app.get("/api/health")
+def health():
+    return {
+        "ok": True,
+        "models": {
+            "metar": str(Path(MODEL_METAR_PATH).resolve()),
+            "taf": str(Path(MODEL_TAF_PATH).resolve()) if model_taf else None,
+            "pirep": str(Path(MODEL_PIREP_PATH).resolve()) if model_pirep else None,
+        },
+        "history_bg": {
+            "enabled": HISTORY_BG_ENABLED,
+            "refresh_seconds": HISTORY_REFRESH_SECONDS,
+            "top_scored_each_tick": HISTORY_BG_TOP,
+            "metar_conus_only": HISTORY_BG_CONUS,
+            "pirep_hours": HISTORY_BG_PIREP_HIREP_HOURS if False else HISTORY_BG_PIREP_HOURS,  # keep simple, avoid refactor
+        },
+    }
+
+
+@app.get("/api/history")
+def history(product: str = Query("METAR"), top: int = Query(25, ge=1, le=200)):
+    p = product.strip().upper()
+    if p not in ("METAR", "TAF", "PIREP"):
+        return JSONResponse(status_code=400, content={"detail": "product must be METAR, TAF, or PIREP"})
+    return get_top(p, top=top)
+
+
+@app.get("/api/leaderboard")
+def leaderboard(top: int = Query(25, ge=1, le=200), conus: bool = Query(True)):
+    last_attempt_used = None
+
+    def _fetch():
+        nonlocal last_attempt_used
+        result = _metar_fetch_with_retry()
+        last_attempt_used = result.get("attempt_used")
+        return result.get("data")
+
+    metars = _cached_fetch(_cache_metar, CACHE_SECONDS, _fetch)
+    now, rows, fetched_count, filtered_count = _score_metars(metars, top=top, conus=conus)
+
+    # Always offer to history (history store is capped to 50/product)
+    offer_rows("METAR", rows)
 
     payload = {
         "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -178,8 +360,8 @@ def leaderboard(
         payload["debug"] = {
             "cache_ttl_seconds": CACHE_SECONDS,
             "attempt_used": last_attempt_used,
-            "fetched": len(metars) if hasattr(metars, "__len__") else None,
-            "filtered": len(filtered) if hasattr(filtered, "__len__") else None,
+            "fetched": fetched_count,
+            "filtered": filtered_count,
             "conus": conus,
             "metar_fetch": get_last_metar_fetch_debug(),
         }
@@ -197,44 +379,17 @@ def taf_leaderboard(top: int = Query(25, ge=1, le=200)):
             return aw_fetch_taf_most_recent_global(session)
 
     tafs = _cached_fetch(_cache_taf, TAF_CACHE_SECONDS, _fetch)
-    now = datetime.now(UTC)
-    month = now.month
 
-    rows = []
-    for t in (tafs or []):
-        raw = (t.get("rawTAF") or t.get("rawOb") or t.get("raw") or "").strip()
-        if not raw:
-            continue
-        try:
-            latf = float(t.get("lat")) if t.get("lat") is not None else None
-            lonf = float(t.get("lon")) if t.get("lon") is not None else None
-        except Exception:
-            latf, lonf = None, None
-        station = (t.get("stationId") or t.get("icaoId") or t.get("station") or "----").strip()
-        rows.append(
-            {
-                "product": "TAF",
-                "station": station,
-                "icaoId": station,
-                "score": taf_score(raw, model_taf, length_weight=TAF_LENGTH_WEIGHT, month=month),
-                "text": raw,
-                "raw": raw,
-                "lat": latf,
-                "lon": lonf,
-            }
-        )
+    now, rows = _score_tafs(tafs, top=top)
+    offer_rows("TAF", rows)
 
-    rows.sort(key=lambda x: x["score"], reverse=True)
-    rows = rows[:top]
-
-    payload = {
+    return {
         "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "product": "TAF",
         "top": top,
         "count": len(rows),
         "rows": rows,
     }
-    return payload
 
 
 @app.get("/api/pirep")
@@ -260,34 +415,8 @@ def pirep_leaderboard(top: int = Query(25, ge=1, le=200), hours: int = Query(24,
         _cache_pirep["hours"] = hours
         pireps = _cache_pirep["data"]
 
-    now = datetime.now(UTC)
-    month = now.month
-
-    rows = []
-    for p in (pireps or []):
-        text = (p.get("raw") or p.get("report") or p.get("text") or p.get("rawOb") or "").strip()
-        if not text:
-            continue
-        try:
-            latf = float(p.get("lat")) if p.get("lat") is not None else None
-            lonf = float(p.get("lon")) if p.get("lon") is not None else None
-        except Exception:
-            latf, lonf = None, None
-        rows.append(
-            {
-                "product": "PIREP",
-                "station": "PIREP",
-                "icaoId": "PIREP",
-                "score": pirep_score(text, model_pirep, length_weight=PIREP_LENGTH_WEIGHT, month=month),
-                "text": text,
-                "raw": text,
-                "lat": latf,
-                "lon": lonf,
-            }
-        )
-
-    rows.sort(key=lambda x: x["score"], reverse=True)
-    rows = rows[:top]
+    now, rows = _score_pireps(pireps, top=top)
+    offer_rows("PIREP", rows)
 
     return {
         "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

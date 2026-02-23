@@ -30,3 +30,11 @@ Thumbs.db
 # Local data
 *.sqlite
 *.db
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local history DB (do not commit)
+backend/data/
+*.db
